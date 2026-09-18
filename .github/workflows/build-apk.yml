@@ -59,12 +59,10 @@ jobs:
           u = u.replace('android:name=".MainActivity"', 'android:name="com.eternal.asharewidget.MainActivity"')
           u = u.replace('android:name=".StockWidgetProvider"', 'android:name="com.eternal.asharewidget.StockWidgetProvider"')
 
-          service = '''
-        <service
-            android:name="com.eternal.asharewidget.QuoteListRemoteViewsService"
-            android:permission="android.permission.BIND_REMOTEVIEWS"
-            android:exported="false" />
-'''
+          service = ('\n        <service\n'
+                     '            android:name="com.eternal.asharewidget.QuoteListRemoteViewsService"\n'
+                     '            android:permission="android.permission.BIND_REMOTEVIEWS"\n'
+                     '            android:exported="false" />\n')
           if "QuoteListRemoteViewsService" not in u:
               u = u.replace("    </application>", service + "    </application>")
           m.write_text(u)
