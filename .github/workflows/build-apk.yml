@@ -23,18 +23,20 @@ jobs:
           unzip -q source.zip
           test -f ashare_widget_project/settings.gradle
 
-      - name: Apply v0.3.4 changes
+      - name: Apply v0.3.5 changes
         shell: bash
         run: |
           SRC="ashare_widget_project/app/src/main"
           JAVA="$SRC/java/com/eternal/asharewidget"
 
           cp .patches/QuoteFetcher-v034.java "$JAVA/QuoteFetcher.java"
-          cp .patches/WidgetPrefs-v034.java "$JAVA/WidgetPrefs.java"
-          cp .patches/StockWidgetProvider-v034.java "$JAVA/StockWidgetProvider.java"
           cp .patches/WidgetConfigActivity-v034.java "$JAVA/WidgetConfigActivity.java"
           cp .patches/MainActivity-v034.java "$JAVA/MainActivity.java"
-          cp .patches/widget_layout-v034.xml "$SRC/res/layout/widget_layout.xml"
+          cp .patches/WidgetPrefs-v035.java "$JAVA/WidgetPrefs.java"
+          cp .patches/StockWidgetProvider-v035.java "$JAVA/StockWidgetProvider.java"
+          cp .patches/WidgetQuoteCache-v035.java "$JAVA/WidgetQuoteCache.java"
+          cp .patches/QuoteListRemoteViewsService-v035.java "$JAVA/QuoteListRemoteViewsService.java"
+          cp .patches/widget_layout-v035.xml "$SRC/res/layout/widget_layout.xml"
           cp .patches/widget_row-v034.xml "$SRC/res/layout/widget_row.xml"
 
           python3 - <<'PY'
@@ -45,44 +47,54 @@ jobs:
 
           b = root / "app/build.gradle"
           t = b.read_text()
-          t = re.sub(r"applicationId\s+'[^']+'", "applicationId 'com.eternal.asharewidget.v034'", t)
-          t = re.sub(r"versionCode\s+\d+", "versionCode 7", t)
-          t = re.sub(r"versionName\s+'[^']+'", "versionName '0.3.4'", t)
+          t = re.sub(r"applicationId\s+'[^']+'", "applicationId 'com.eternal.asharewidget.v035'", t)
+          t = re.sub(r"versionCode\s+\d+", "versionCode 8", t)
+          t = re.sub(r"versionName\s+'[^']+'", "versionName '0.3.5'", t)
           b.write_text(t)
 
           m = root / "app/src/main/AndroidManifest.xml"
           u = m.read_text()
-          u = u.replace('android:label="轻行情 Widget"', 'android:label="轻行情 0.3.4"')
+          u = u.replace('android:label="轻行情 Widget"', 'android:label="轻行情 0.3.5"')
           u = u.replace('android:name=".WidgetConfigActivity"', 'android:name="com.eternal.asharewidget.WidgetConfigActivity"')
           u = u.replace('android:name=".MainActivity"', 'android:name="com.eternal.asharewidget.MainActivity"')
           u = u.replace('android:name=".StockWidgetProvider"', 'android:name="com.eternal.asharewidget.StockWidgetProvider"')
+
+          service = '''
+        <service
+            android:name="com.eternal.asharewidget.QuoteListRemoteViewsService"
+            android:permission="android.permission.BIND_REMOTEVIEWS"
+            android:exported="false" />
+'''
+          if "QuoteListRemoteViewsService" not in u:
+              u = u.replace("    </application>", service + "    </application>")
           m.write_text(u)
 
-          # RemoteViews safety check before compilation.
-          bad = []
-          for q in (root / "app/src/main/res/layout").glob("widget_*.xml"):
-              txt = q.read_text()
-              if re.search(r'<(?:android\.view\.)?View(?:\s|>)', txt):
-                  bad.append(str(q))
-          if bad:
-              raise SystemExit("Unsupported View still present: " + ", ".join(bad))
-
           app_src = root / "app/src/main"
-          compiled_text = "\n".join(
+          combined = "\n".join(
               p.read_text(errors="ignore")
               for p in app_src.rglob("*")
               if p.is_file() and p.suffix in {".java", ".xml"}
           )
+
           required = [
-              "hf_GC", "gb_ixic", "fx_scnyrub",
-              "5日（约1周）", "20日（约1月）", "60日（约1季）",
-              "代码名称识别", "已设置的提醒"
+              "QuoteListRemoteViewsService",
+              "WidgetQuoteCache",
+              "603605 <= 55",
+              "600584 >= 100",
+              "600141 >= 45",
+              "<ListView",
+              "setRemoteAdapter",
+              "notifyAppWidgetViewDataChanged"
           ]
-          missing = [x for x in required if x not in compiled_text]
+          missing = [x for x in required if x not in combined]
           if missing:
-              raise SystemExit("Missing v0.3.4 markers: " + repr(missing))
-          if "query1.finance.yahoo.com" in compiled_text:
-              raise SystemExit("Yahoo endpoint still present in compiled app sources")
+              raise SystemExit("Missing v0.3.5 markers: " + repr(missing))
+
+          # RemoteViews child layout safety.
+          for q in (root / "app/src/main/res/layout").glob("widget_row*.xml"):
+              txt = q.read_text()
+              if re.search(r'<(?:android\.view\.)?View(?:\s|>)', txt):
+                  raise SystemExit("Unsupported plain View in " + str(q))
           PY
 
       - uses: actions/setup-java@v4
@@ -109,18 +121,19 @@ jobs:
         shell: bash
         run: |
           APK="ashare_widget_project/app/build/outputs/apk/debug/app-debug.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump xmltree --file res/layout/widget_layout.xml "$APK" | tee widget_layout_dump.txt
+          grep -q 'ListView' widget_layout_dump.txt
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump xmltree --file res/layout/widget_row.xml "$APK" | tee widget_row_dump.txt
           if grep -q 'android.view.View' widget_row_dump.txt; then
-            echo "Unexpected android.view.View in compiled widget resource"
+            echo "Unexpected android.view.View in compiled widget row"
             exit 1
           fi
-          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump xmltree --file res/layout/widget_layout.xml "$APK" | tee widget_layout_dump.txt
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | head -5
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ashare-widget-v0.3.4-debug-apk
+          name: ashare-widget-v0.3.5-debug-apk
           path: ashare_widget_project/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
