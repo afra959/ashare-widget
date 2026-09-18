@@ -20,50 +20,90 @@ jobs:
           base64 -d source.b64 > source.zip
           unzip -q source.zip
           test -f ashare_widget_project/settings.gradle
-      - name: Apply v0.3.1 RemoteViews compatibility fix
+
+      - name: Apply v0.3.2 launcher compatibility build
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path("ashare_widget_project/app/src/main/res/layout/widget_row.xml")
+          import re
+
+          root = Path("ashare_widget_project")
+
+          # 1) RemoteViews cannot inflate plain android.view.View.
+          p = root / "app/src/main/res/layout/widget_row.xml"
           s = p.read_text()
-          old = '''    <View
-                  android:layout_width="match_parent"
-                  android:layout_height="1dp"
-                  android:background="#293240" />'''
-          new = '''    <TextView
-                  android:layout_width="match_parent"
-                  android:layout_height="1dp"
-                  android:background="#293240"
-                  android:text="" />'''
-          if old not in s:
-              raise SystemExit("Expected separator View not found")
-          p.write_text(s.replace(old, new))
-          b = Path("ashare_widget_project/app/build.gradle")
-          t = b.read_text().replace("versionCode 3", "versionCode 4").replace("versionName '0.3.0'", "versionName '0.3.1'")
+          s = re.sub(
+              r'<View\s+android:layout_width="match_parent"\s+android:layout_height="1dp"\s+android:background="#293240"\s*/>',
+              '<TextView\n        android:layout_width="match_parent"\n        android:layout_height="1dp"\n        android:background="#293240"\n        android:text="" />',
+              s,
+              flags=re.S,
+          )
+          p.write_text(s)
+
+          # 2) Give this diagnostic/fixed build a fresh application id so MIUI cannot reuse
+          # stale widget resources from the old package.
+          b = root / "app/build.gradle"
+          t = b.read_text()
+          t = re.sub(r"applicationId\s+'[^']+'", "applicationId 'com.eternal.asharewidget.v032'", t)
+          t = re.sub(r"versionCode\s+\d+", "versionCode 5", t)
+          t = re.sub(r"versionName\s+'[^']+'", "versionName '0.3.2'", t)
           b.write_text(t)
+
+          # 3) Component classes live in the original Java package; make manifest names explicit.
+          m = root / "app/src/main/AndroidManifest.xml"
+          u = m.read_text()
+          u = u.replace('android:label="轻行情 Widget"', 'android:label="轻行情 0.3.2"')
+          u = u.replace('android:name=".WidgetConfigActivity"', 'android:name="com.eternal.asharewidget.WidgetConfigActivity"')
+          u = u.replace('android:name=".MainActivity"', 'android:name="com.eternal.asharewidget.MainActivity"')
+          u = u.replace('android:name=".StockWidgetProvider"', 'android:name="com.eternal.asharewidget.StockWidgetProvider"')
+          m.write_text(u)
+
+          # Hard fail if any plain View remains in RemoteViews layouts.
+          bad = []
+          for q in (root / "app/src/main/res/layout").glob("widget_*.xml"):
+              txt = q.read_text()
+              if re.search(r'<(?:android\.view\.)?View(?:\s|>)', txt):
+                  bad.append(str(q))
+          if bad:
+              raise SystemExit("Unsupported View still present: " + ", ".join(bad))
           PY
-          ! grep -R '<View[ >]' ashare_widget_project/app/src/main/res/layout/widget_*.xml
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+
       - name: Install Android SDK packages
         shell: bash
         run: |
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'platform-tools'
+
       - name: Build debug APK
         working-directory: ashare_widget_project
         run: gradle :app:assembleDebug --stacktrace
+
+      - name: Verify compiled widget resource
+        shell: bash
+        run: |
+          APK="ashare_widget_project/app/build/outputs/apk/debug/app-debug.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump xmltree --file res/layout/widget_row.xml "$APK" | tee widget_row_dump.txt
+          if grep -q 'android.view.View' widget_row_dump.txt; then
+            echo "Unexpected android.view.View in compiled widget resource"
+            exit 1
+          fi
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | head -5
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ashare-widget-v0.3.1-debug-apk
+          name: ashare-widget-v0.3.2-debug-apk
           path: ashare_widget_project/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
