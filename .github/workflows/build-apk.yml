@@ -11,8 +11,10 @@ jobs:
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Restore source archive
         shell: bash
         run: |
@@ -21,16 +23,18 @@ jobs:
           unzip -q source.zip
           test -f ashare_widget_project/settings.gradle
 
-      - name: Apply v0.3.2 launcher compatibility build
+      - name: Apply v0.3.3 changes
         shell: bash
         run: |
+          cp .patches/WidgetConfigActivity-v033.java             ashare_widget_project/app/src/main/java/com/eternal/asharewidget/WidgetConfigActivity.java
+
           python3 - <<'PY'
           from pathlib import Path
           import re
 
           root = Path("ashare_widget_project")
 
-          # 1) RemoteViews cannot inflate plain android.view.View.
+          # RemoteViews compatibility fix confirmed by the user's Android 14 / HyperOS logcat.
           p = root / "app/src/main/res/layout/widget_row.xml"
           s = p.read_text()
           s = re.sub(
@@ -41,25 +45,23 @@ jobs:
           )
           p.write_text(s)
 
-          # 2) Give this diagnostic/fixed build a fresh application id so MIUI cannot reuse
-          # stale widget resources from the old package.
+          # Fresh package id for this debug-signed build; avoids signature/cache conflicts
+          # with v0.3.2. We can consolidate package/signing later.
           b = root / "app/build.gradle"
           t = b.read_text()
-          t = re.sub(r"applicationId\s+'[^']+'", "applicationId 'com.eternal.asharewidget.v032'", t)
-          t = re.sub(r"versionCode\s+\d+", "versionCode 5", t)
-          t = re.sub(r"versionName\s+'[^']+'", "versionName '0.3.2'", t)
+          t = re.sub(r"applicationId\s+'[^']+'", "applicationId 'com.eternal.asharewidget.v033'", t)
+          t = re.sub(r"versionCode\s+\d+", "versionCode 6", t)
+          t = re.sub(r"versionName\s+'[^']+'", "versionName '0.3.3'", t)
           b.write_text(t)
 
-          # 3) Component classes live in the original Java package; make manifest names explicit.
           m = root / "app/src/main/AndroidManifest.xml"
           u = m.read_text()
-          u = u.replace('android:label="轻行情 Widget"', 'android:label="轻行情 0.3.2"')
+          u = u.replace('android:label="轻行情 Widget"', 'android:label="轻行情 0.3.3"')
           u = u.replace('android:name=".WidgetConfigActivity"', 'android:name="com.eternal.asharewidget.WidgetConfigActivity"')
           u = u.replace('android:name=".MainActivity"', 'android:name="com.eternal.asharewidget.MainActivity"')
           u = u.replace('android:name=".StockWidgetProvider"', 'android:name="com.eternal.asharewidget.StockWidgetProvider"')
           m.write_text(u)
 
-          # Hard fail if any plain View remains in RemoteViews layouts.
           bad = []
           for q in (root / "app/src/main/res/layout").glob("widget_*.xml"):
               txt = q.read_text()
@@ -67,6 +69,13 @@ jobs:
                   bad.append(str(q))
           if bad:
               raise SystemExit("Unsupported View still present: " + ", ".join(bad))
+
+          cfg = root / "app/src/main/java/com/eternal/asharewidget/WidgetConfigActivity.java"
+          cfg_text = cfg.read_text()
+          required = ["已设置的提醒", "保存修改", "删除", "腾讯财经", "Yahoo Finance"]
+          missing = [x for x in required if x not in cfg_text]
+          if missing:
+              raise SystemExit("Missing v0.3.3 UI markers: " + repr(missing))
           PY
 
       - uses: actions/setup-java@v4
@@ -89,7 +98,7 @@ jobs:
         working-directory: ashare_widget_project
         run: gradle :app:assembleDebug --stacktrace
 
-      - name: Verify compiled widget resource
+      - name: Verify APK
         shell: bash
         run: |
           APK="ashare_widget_project/app/build/outputs/apk/debug/app-debug.apk"
@@ -104,6 +113,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ashare-widget-v0.3.2-debug-apk
+          name: ashare-widget-v0.3.3-debug-apk
           path: ashare_widget_project/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
