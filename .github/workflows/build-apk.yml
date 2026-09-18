@@ -20,6 +20,30 @@ jobs:
           base64 -d source.b64 > source.zip
           unzip -q source.zip
           test -f ashare_widget_project/settings.gradle
+      - name: Apply v0.3.1 RemoteViews compatibility fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("ashare_widget_project/app/src/main/res/layout/widget_row.xml")
+          s = p.read_text()
+          old = '''    <View
+                  android:layout_width="match_parent"
+                  android:layout_height="1dp"
+                  android:background="#293240" />'''
+          new = '''    <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="1dp"
+                  android:background="#293240"
+                  android:text="" />'''
+          if old not in s:
+              raise SystemExit("Expected separator View not found")
+          p.write_text(s.replace(old, new))
+          b = Path("ashare_widget_project/app/build.gradle")
+          t = b.read_text().replace("versionCode 3", "versionCode 4").replace("versionName '0.3.0'", "versionName '0.3.1'")
+          b.write_text(t)
+          PY
+          ! grep -R '<View[ >]' ashare_widget_project/app/src/main/res/layout/widget_*.xml
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -40,6 +64,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ashare-widget-debug-apk
+          name: ashare-widget-v0.3.1-debug-apk
           path: ashare_widget_project/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
