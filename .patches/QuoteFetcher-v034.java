@@ -284,23 +284,24 @@ public final class QuoteFetcher {
         List<Double> fromJson = parseJsonpCloses(body, days);
         if (!fromJson.isEmpty()) return fromJson;
 
-        int start = body.indexOf("(\\"");
-        int end = body.lastIndexOf("\\")");
-        if (start < 0 || end <= start + 2) {
-            start = body.indexOf("(\"");
-            end = body.lastIndexOf("\")");
-        }
-        if (start < 0 || end <= start + 2) return new ArrayList<>();
+        // Some Sina forex responses wrap a pipe-separated payload in JSONP.
+        // Strip the outer parentheses/quotes without fragile escaped quote matching.
+        int openParen = body.indexOf('(');
+        int closeParen = body.lastIndexOf(')');
+        if (openParen < 0 || closeParen <= openParen) return new ArrayList<>();
 
-        String payload = body.substring(start + 2, end)
-                .replace("\\\"", "\"")
-                .replace("\\/", "/");
+        String payload = body.substring(openParen + 1, closeParen).trim();
+        if (payload.length() >= 2 && payload.charAt(0) == '"' && payload.charAt(payload.length() - 1) == '"') {
+            payload = payload.substring(1, payload.length() - 1);
+        }
+        payload = payload.replace("\\\"", "\"").replace("\\/", "/");
+
         List<Double> closes = new ArrayList<>();
         for (String rec : payload.split("\\|")) {
-            String s = rec.trim();
-            if (s.startsWith(",")) s = s.substring(1);
-            if (s.isEmpty()) continue;
-            String[] f = s.split(",");
+            String rowText = rec.trim();
+            if (rowText.startsWith(",")) rowText = rowText.substring(1);
+            if (rowText.isEmpty()) continue;
+            String[] f = rowText.split(",");
             // Historical forex daily rows are normally date,open,high,low,close.
             if (f.length >= 5) {
                 double close = parse(f[4]);
