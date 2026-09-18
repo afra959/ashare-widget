@@ -23,10 +23,19 @@ jobs:
           unzip -q source.zip
           test -f ashare_widget_project/settings.gradle
 
-      - name: Apply v0.3.3 changes
+      - name: Apply v0.3.4 changes
         shell: bash
         run: |
-          cp .patches/WidgetConfigActivity-v033.java             ashare_widget_project/app/src/main/java/com/eternal/asharewidget/WidgetConfigActivity.java
+          SRC="ashare_widget_project/app/src/main"
+          JAVA="$SRC/java/com/eternal/asharewidget"
+
+          cp .patches/QuoteFetcher-v034.java "$JAVA/QuoteFetcher.java"
+          cp .patches/WidgetPrefs-v034.java "$JAVA/WidgetPrefs.java"
+          cp .patches/StockWidgetProvider-v034.java "$JAVA/StockWidgetProvider.java"
+          cp .patches/WidgetConfigActivity-v034.java "$JAVA/WidgetConfigActivity.java"
+          cp .patches/MainActivity-v034.java "$JAVA/MainActivity.java"
+          cp .patches/widget_layout-v034.xml "$SRC/res/layout/widget_layout.xml"
+          cp .patches/widget_row-v034.xml "$SRC/res/layout/widget_row.xml"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -34,34 +43,22 @@ jobs:
 
           root = Path("ashare_widget_project")
 
-          # RemoteViews compatibility fix confirmed by the user's Android 14 / HyperOS logcat.
-          p = root / "app/src/main/res/layout/widget_row.xml"
-          s = p.read_text()
-          s = re.sub(
-              r'<View\s+android:layout_width="match_parent"\s+android:layout_height="1dp"\s+android:background="#293240"\s*/>',
-              '<TextView\n        android:layout_width="match_parent"\n        android:layout_height="1dp"\n        android:background="#293240"\n        android:text="" />',
-              s,
-              flags=re.S,
-          )
-          p.write_text(s)
-
-          # Fresh package id for this debug-signed build; avoids signature/cache conflicts
-          # with v0.3.2. We can consolidate package/signing later.
           b = root / "app/build.gradle"
           t = b.read_text()
-          t = re.sub(r"applicationId\s+'[^']+'", "applicationId 'com.eternal.asharewidget.v033'", t)
-          t = re.sub(r"versionCode\s+\d+", "versionCode 6", t)
-          t = re.sub(r"versionName\s+'[^']+'", "versionName '0.3.3'", t)
+          t = re.sub(r"applicationId\s+'[^']+'", "applicationId 'com.eternal.asharewidget.v034'", t)
+          t = re.sub(r"versionCode\s+\d+", "versionCode 7", t)
+          t = re.sub(r"versionName\s+'[^']+'", "versionName '0.3.4'", t)
           b.write_text(t)
 
           m = root / "app/src/main/AndroidManifest.xml"
           u = m.read_text()
-          u = u.replace('android:label="轻行情 Widget"', 'android:label="轻行情 0.3.3"')
+          u = u.replace('android:label="轻行情 Widget"', 'android:label="轻行情 0.3.4"')
           u = u.replace('android:name=".WidgetConfigActivity"', 'android:name="com.eternal.asharewidget.WidgetConfigActivity"')
           u = u.replace('android:name=".MainActivity"', 'android:name="com.eternal.asharewidget.MainActivity"')
           u = u.replace('android:name=".StockWidgetProvider"', 'android:name="com.eternal.asharewidget.StockWidgetProvider"')
           m.write_text(u)
 
+          # RemoteViews safety check before compilation.
           bad = []
           for q in (root / "app/src/main/res/layout").glob("widget_*.xml"):
               txt = q.read_text()
@@ -70,12 +67,22 @@ jobs:
           if bad:
               raise SystemExit("Unsupported View still present: " + ", ".join(bad))
 
-          cfg = root / "app/src/main/java/com/eternal/asharewidget/WidgetConfigActivity.java"
-          cfg_text = cfg.read_text()
-          required = ["已设置的提醒", "保存修改", "删除", "腾讯财经", "Yahoo Finance"]
-          missing = [x for x in required if x not in cfg_text]
+          app_src = root / "app/src/main"
+          compiled_text = "\n".join(
+              p.read_text(errors="ignore")
+              for p in app_src.rglob("*")
+              if p.is_file() and p.suffix in {".java", ".xml"}
+          )
+          required = [
+              "hf_GC", "gb_ixic", "fx_scnyrub",
+              "5日（约1周）", "20日（约1月）", "60日（约1季）",
+              "代码名称识别", "已设置的提醒"
+          ]
+          missing = [x for x in required if x not in compiled_text]
           if missing:
-              raise SystemExit("Missing v0.3.3 UI markers: " + repr(missing))
+              raise SystemExit("Missing v0.3.4 markers: " + repr(missing))
+          if "query1.finance.yahoo.com" in compiled_text:
+              raise SystemExit("Yahoo endpoint still present in compiled app sources")
           PY
 
       - uses: actions/setup-java@v4
@@ -107,12 +114,13 @@ jobs:
             echo "Unexpected android.view.View in compiled widget resource"
             exit 1
           fi
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump xmltree --file res/layout/widget_layout.xml "$APK" | tee widget_layout_dump.txt
           "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | head -5
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ashare-widget-v0.3.3-debug-apk
+          name: ashare-widget-v0.3.4-debug-apk
           path: ashare_widget_project/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: warn
