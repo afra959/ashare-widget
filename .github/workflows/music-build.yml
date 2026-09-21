@@ -4,7 +4,7 @@ on:
   push:
     branches: [ chatgpt-music-build-v1 ]
     paths:
-      - '.buildtrigger/music-v1'
+      - '.buildtrigger/music-*'
 
 jobs:
   build:
