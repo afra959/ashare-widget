@@ -1,37 +1,22 @@
 package com.afra.music;
 
 import android.app.Activity;
-import android.content.ComponentName;
-import android.content.Context;
 import android.content.Intent;
+import android.media.AudioManager;
 import android.os.Bundle;
-import android.provider.Settings;
-import android.text.TextUtils;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.KeyEvent;
 import android.widget.Toast;
 
 public class MainActivity extends Activity {
 
     private static final String TARGET_PACKAGE = "com.netease.cloudmusic";
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-
-        if (!isAccessibilityServiceEnabled(this, MusicAccessibilityService.class)) {
-            Toast.makeText(
-                    this,
-                    "首次使用：请开启“音乐快捷播放”无障碍服务",
-                    Toast.LENGTH_LONG
-            ).show();
-            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
-            finish();
-            return;
-        }
-
-        getSharedPreferences("music", MODE_PRIVATE)
-                .edit()
-                .putLong("pending_play_until", System.currentTimeMillis() + 15000L)
-                .apply();
 
         Intent launchIntent = getPackageManager().getLaunchIntentForPackage(TARGET_PACKAGE);
 
@@ -47,34 +32,66 @@ public class MainActivity extends Activity {
         );
 
         startActivity(launchIntent);
-        finish();
+
+        // 网易云从后台恢复和冷启动耗时不同。
+        // MEDIA_PLAY 可以重复发送：暂停时会播放，已播放时不会变成暂停。
+        handler.postDelayed(this::sendPlay, 700L);
+        handler.postDelayed(this::sendPlay, 1400L);
+        handler.postDelayed(this::sendPlay, 2400L);
+        handler.postDelayed(this::sendPlay, 3600L);
+
+        handler.postDelayed(this::finish, 4300L);
     }
 
-    private static boolean isAccessibilityServiceEnabled(
-            Context context,
-            Class<?> serviceClass
-    ) {
-        ComponentName expected = new ComponentName(context, serviceClass);
+    private void sendPlay() {
+        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
 
-        String enabledServices = Settings.Secure.getString(
-                context.getContentResolver(),
-                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        if (audioManager == null) {
+            return;
+        }
+
+        long now = android.os.SystemClock.uptimeMillis();
+
+        KeyEvent down = new KeyEvent(
+                now,
+                now,
+                KeyEvent.ACTION_DOWN,
+                KeyEvent.KEYCODE_MEDIA_PLAY,
+                0
         );
 
-        if (TextUtils.isEmpty(enabledServices)) {
-            return false;
+        KeyEvent up = new KeyEvent(
+                now,
+                now,
+                KeyEvent.ACTION_UP,
+                KeyEvent.KEYCODE_MEDIA_PLAY,
+                0
+        );
+
+        try {
+            audioManager.dispatchMediaKeyEvent(down);
+            audioManager.dispatchMediaKeyEvent(up);
+        } catch (Exception ignored) {
         }
 
-        TextUtils.SimpleStringSplitter splitter = new TextUtils.SimpleStringSplitter(':');
-        splitter.setString(enabledServices);
+        // 再补一个只发给网易云包的显式 MEDIA_BUTTON。
+        try {
+            Intent downIntent = new Intent(Intent.ACTION_MEDIA_BUTTON);
+            downIntent.setPackage(TARGET_PACKAGE);
+            downIntent.putExtra(Intent.EXTRA_KEY_EVENT, down);
+            sendBroadcast(downIntent);
 
-        while (splitter.hasNext()) {
-            ComponentName actual = ComponentName.unflattenFromString(splitter.next());
-            if (expected.equals(actual)) {
-                return true;
-            }
+            Intent upIntent = new Intent(Intent.ACTION_MEDIA_BUTTON);
+            upIntent.setPackage(TARGET_PACKAGE);
+            upIntent.putExtra(Intent.EXTRA_KEY_EVENT, up);
+            sendBroadcast(upIntent);
+        } catch (Exception ignored) {
         }
+    }
 
-        return false;
+    @Override
+    protected void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
+        super.onDestroy();
     }
 }
