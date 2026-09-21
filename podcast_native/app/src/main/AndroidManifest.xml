@@ -6,6 +6,7 @@
     </queries>
 
     <application
+        android:icon="@drawable/ic_podcast"
         android:allowBackup="false"
         android:label="播客"
         android:supportsRtl="true">
