@@ -3,6 +3,8 @@ name: Build Podcast APK
 on:
   push:
     branches: [ chatgpt-podcast-build-v1 ]
+    paths:
+      - '.buildtrigger/podcast'
 
 jobs:
   build:
@@ -13,13 +15,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Restore source
-        shell: bash
-        run: |
-          mkdir -p podcast_native
-          base64 -d .buildsrc/podcast_native_source.b64 > podcast_native.zip
-          unzip -q podcast_native.zip -d podcast_native
 
       - uses: actions/setup-java@v4
         with:
