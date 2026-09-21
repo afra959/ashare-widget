@@ -1,0 +1,56 @@
+name: Build Podcast APK
+
+on:
+  push:
+    branches: [ chatgpt-podcast-build-v1 ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore source
+        shell: bash
+        run: |
+          mkdir -p podcast_native
+          base64 -d .buildsrc/podcast_native_source.b64 > podcast_native.zip
+          unzip -q podcast_native.zip -d podcast_native
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-34' 'build-tools;34.0.0' 'platform-tools'
+
+      - name: Build debug APK
+        working-directory: podcast_native
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Show APK info
+        shell: bash
+        run: |
+          APK="podcast_native/app/build/outputs/apk/debug/app-debug.apk"
+          ls -lh "$APK"
+          "$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging "$APK" | head -10
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: podcast-debug-apk
+          path: podcast_native/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
