@@ -32,11 +32,6 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager 'platforms;android-34' 'build-tools;34.0.0' 'platform-tools'
 
-      - name: Restore exact approved icon
-        shell: bash
-        run: |
-          base64 -d .buildsrc/music_icon_exact.b64 > music_native/app/src/main/res/drawable/ic_music_exact.png
-
       - name: Build debug APK
         working-directory: music_native
         run: gradle :app:assembleDebug --stacktrace
