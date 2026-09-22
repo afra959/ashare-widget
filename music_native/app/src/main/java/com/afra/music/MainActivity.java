@@ -1,6 +1,8 @@
 package com.afra.music;
 
 import android.app.Activity;
+import android.app.Notification;
+import android.app.PendingIntent;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.media.session.MediaController;
@@ -10,7 +12,6 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
-import android.service.notification.NotificationListenerService;
 import android.text.TextUtils;
 import android.view.KeyEvent;
 import android.widget.Toast;
@@ -51,116 +52,81 @@ public class MainActivity extends Activity {
             return;
         }
 
-        try {
-            NotificationListenerService.requestRebind(listenerComponent);
-        } catch (Exception ignored) {
-        }
-
-        // 关键变化：不先打开网易云。
-        // 在本 Activity 仍位于前台时，直接控制网易云现有 MediaSession。
-        attemptDirectPlay(0);
+        startDirectPlayback();
     }
 
-    private void attemptDirectPlay(int stage) {
+    private void startDirectPlayback() {
         MediaController controller = findNetEaseController();
 
         if (controller == null) {
-            // 通知监听刚重连时，给系统极短的时间建立访问。
-            if (stage < 2) {
-                handler.postDelayed(() -> attemptDirectPlay(stage + 1), 250L);
-                return;
-            }
-
-            // 没有可恢复的网易云媒体会话时，才退回到打开网易云。
-            Intent launchIntent =
-                    getPackageManager().getLaunchIntentForPackage(TARGET_PACKAGE);
-
-            if (launchIntent != null) {
-                launchIntent.addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK
-                                | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-                );
-                startActivity(launchIntent);
-                Toast.makeText(
-                        this,
-                        "网易云当前没有可恢复的播放会话，已打开网易云",
-                        Toast.LENGTH_SHORT
-                ).show();
-            } else {
-                Toast.makeText(this, "未找到网易云音乐", Toast.LENGTH_SHORT).show();
-            }
-
-            finishSafely();
+            launchNetEaseWithoutSession();
             return;
         }
 
         PlaybackState state = controller.getPlaybackState();
 
-        if (state != null && state.getState() == PlaybackState.STATE_PLAYING) {
-            // 已播放，不做任何操作，避免误暂停。
+        if (isAlreadyProgressing(state)) {
             finishSafely();
             return;
         }
 
-        long actions = state == null ? 0L : state.getActions();
+        try {
+            MediaController.TransportControls controls =
+                    controller.getTransportControls();
 
-        // 日志已确认网易云 actions=822，包含 ACTION_PLAY。
-        if (state == null || (actions & PlaybackState.ACTION_PLAY) != 0L) {
-            try {
-                controller.getTransportControls().play();
-            } catch (Exception ignored) {
+            if (controls != null) {
+                controls.play();
             }
+        } catch (Exception ignored) {
         }
 
-        // 在前台短暂等待后，重新读取这个“指定网易云 Session”的真实状态。
-        handler.postDelayed(() -> verifyAfterPlay(controller), 280L);
+        // 给网易云足够时间更新 MediaSession，避免过早兜底导致反向暂停。
+        handler.postDelayed(this::verifyAfterTransportPlay, 900L);
     }
 
-    private void verifyAfterPlay(MediaController originalController) {
-        MediaController freshController = findNetEaseController();
+    private void verifyAfterTransportPlay() {
+        MediaController controller = findNetEaseController();
 
-        if (freshController == null) {
-            freshController = originalController;
+        if (controller == null) {
+            finishWithFailure("播放失败：网易云 MediaSession 消失");
+            return;
         }
 
-        PlaybackState state =
-                freshController == null ? null : freshController.getPlaybackState();
+        PlaybackState state = controller.getPlaybackState();
 
-        if (state != null && state.getState() == PlaybackState.STATE_PLAYING) {
+        if (isAlreadyProgressing(state)) {
             finishSafely();
             return;
         }
 
-        if (freshController != null) {
-            // play() 若被网易云忽略，使用“指定 MediaController”的媒体键兜底。
-            // 这不是全局媒体键，不会送给正在播放的小宇宙。
-            try {
-                long now = android.os.SystemClock.uptimeMillis();
+        // 只发送定向 MEDIA_PLAY，不使用 PLAY_PAUSE。
+        // 即使网易云状态更新稍慢，也不会把已经播放的音乐切回暂停。
+        sendTargetedMediaPlay(controller);
 
-                KeyEvent down = new KeyEvent(
-                        now,
-                        now,
-                        KeyEvent.ACTION_DOWN,
-                        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-                        0
-                );
+        handler.postDelayed(this::verifyAfterMediaPlay, 900L);
+    }
 
-                KeyEvent up = new KeyEvent(
-                        now,
-                        now,
-                        KeyEvent.ACTION_UP,
-                        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-                        0
-                );
+    private void verifyAfterMediaPlay() {
+        MediaController controller = findNetEaseController();
 
-                freshController.dispatchMediaButtonEvent(down);
-                freshController.dispatchMediaButtonEvent(up);
-
-            } catch (Exception ignored) {
-            }
+        if (controller == null) {
+            finishWithFailure("播放失败：未读取到网易云 MediaSession");
+            return;
         }
 
-        handler.postDelayed(this::finalVerification, 350L);
+        PlaybackState state = controller.getPlaybackState();
+
+        if (isAlreadyProgressing(state)) {
+            finishSafely();
+            return;
+        }
+
+        // 最后只在状态仍明确不是播放时，尝试网易云自己的通知 toggle。
+        if (tryNotificationToggle()) {
+            handler.postDelayed(this::finalVerification, 800L);
+        } else {
+            finalVerification();
+        }
     }
 
     private void finalVerification() {
@@ -168,22 +134,111 @@ public class MainActivity extends Activity {
         PlaybackState state =
                 controller == null ? null : controller.getPlaybackState();
 
-        if (state != null && state.getState() == PlaybackState.STATE_PLAYING) {
+        if (isAlreadyProgressing(state)) {
             finishSafely();
             return;
         }
 
-        String detail = "播放失败";
-
-        if (state != null) {
-            detail += "（state=" + state.getState()
-                    + ", actions=" + state.getActions() + "）";
+        if (state == null) {
+            finishWithFailure("播放失败：网易云状态为空");
         } else {
-            detail += "（未读取到网易云 MediaSession）";
+            finishWithFailure(
+                    "播放失败（state=" + state.getState()
+                            + ", actions=" + state.getActions() + "）"
+            );
+        }
+    }
+
+    private boolean isAlreadyProgressing(PlaybackState state) {
+        if (state == null) {
+            return false;
         }
 
-        Toast.makeText(this, detail, Toast.LENGTH_LONG).show();
-        finishSafely();
+        int s = state.getState();
+
+        return s == PlaybackState.STATE_PLAYING
+                || s == PlaybackState.STATE_BUFFERING
+                || s == PlaybackState.STATE_CONNECTING;
+    }
+
+    private void sendTargetedMediaPlay(MediaController controller) {
+        try {
+            long now = android.os.SystemClock.uptimeMillis();
+
+            KeyEvent down = new KeyEvent(
+                    now,
+                    now,
+                    KeyEvent.ACTION_DOWN,
+                    KeyEvent.KEYCODE_MEDIA_PLAY,
+                    0
+            );
+
+            KeyEvent up = new KeyEvent(
+                    now,
+                    now,
+                    KeyEvent.ACTION_UP,
+                    KeyEvent.KEYCODE_MEDIA_PLAY,
+                    0
+            );
+
+            controller.dispatchMediaButtonEvent(down);
+            controller.dispatchMediaButtonEvent(up);
+
+        } catch (Exception ignored) {
+        }
+    }
+
+    private boolean tryNotificationToggle() {
+        MusicNotificationListenerService service =
+                MusicNotificationListenerService.instance;
+
+        if (service == null) {
+            return false;
+        }
+
+        try {
+            android.service.notification.StatusBarNotification[] items =
+                    service.getActiveNotifications();
+
+            if (items == null) {
+                return false;
+            }
+
+            for (android.service.notification.StatusBarNotification sbn : items) {
+                if (sbn == null
+                        || !TARGET_PACKAGE.equals(sbn.getPackageName())) {
+                    continue;
+                }
+
+                Notification n = sbn.getNotification();
+
+                if (n == null || n.actions == null) {
+                    continue;
+                }
+
+                for (Notification.Action action : n.actions) {
+                    if (action == null || action.actionIntent == null) {
+                        continue;
+                    }
+
+                    String title = String.valueOf(action.title);
+
+                    if ("toggle".equalsIgnoreCase(title)
+                            || "播放".equals(title)
+                            || "继续播放".equals(title)) {
+                        try {
+                            action.actionIntent.send();
+                            return true;
+                        } catch (PendingIntent.CanceledException ignored) {
+                        }
+                    }
+                }
+            }
+
+        } catch (Exception ignored) {
+        }
+
+        return false;
     }
 
     private MediaController findNetEaseController() {
@@ -213,6 +268,36 @@ public class MainActivity extends Activity {
         }
 
         return null;
+    }
+
+    private void launchNetEaseWithoutSession() {
+        Intent launchIntent =
+                getPackageManager().getLaunchIntentForPackage(TARGET_PACKAGE);
+
+        if (launchIntent != null) {
+            launchIntent.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            );
+
+            startActivity(launchIntent);
+
+            Toast.makeText(
+                    this,
+                    "网易云当前没有可恢复的媒体会话，已打开网易云",
+                    Toast.LENGTH_SHORT
+            ).show();
+
+        } else {
+            Toast.makeText(this, "未找到网易云音乐", Toast.LENGTH_SHORT).show();
+        }
+
+        finishSafely();
+    }
+
+    private void finishWithFailure(String message) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+        finishSafely();
     }
 
     private boolean isNotificationAccessEnabled() {
