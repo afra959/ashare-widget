@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">跳跳</string>
+    <string name="accessibility_description">仅在指定应用刚打开后的短时间内识别并点击明确的开屏广告跳过按钮。</string>
+</resources>
