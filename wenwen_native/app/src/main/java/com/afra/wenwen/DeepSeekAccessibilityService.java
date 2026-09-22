@@ -453,22 +453,120 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
     private void trySendNow(AccessibilityNodeInfo root) {
         if (!automationRunning || !isPending()) return;
 
-        AccessibilityNodeInfo semantic =
-                findSemanticSendCandidate(root);
+        // 当前 DeepSeek 真实树已确认会出现 desc=发送 的语义节点，
+        // 但该节点本身 clickable=false。
+        AccessibilityNodeInfo sendSemantic =
+                findByExactTextOrDesc(root, "发送");
 
-        if (semantic != null
-                && clickNodeOrParent(semantic)) {
-            handler.postDelayed(this::verifySent, 700L);
-            return;
+        if (sendSemantic == null) {
+            sendSemantic = findSemanticSendCandidate(root);
         }
 
+        if (sendSemantic != null) {
+            AccessibilityNodeInfo hitTarget =
+                    findClickableContainerForNode(root, sendSemantic);
+
+            if (hitTarget != null) {
+                if (clickExactTarget(hitTarget)) {
+                    handler.postDelayed(this::verifySent, 750L);
+                    return;
+                }
+            }
+
+            // 最后直接点“发送”语义节点自身的可视中心。
+            Rect semanticBounds = new Rect();
+            sendSemantic.getBoundsInScreen(semanticBounds);
+
+            if (!semanticBounds.isEmpty()
+                    && clickAt(
+                    semanticBounds.exactCenterX(),
+                    semanticBounds.exactCenterY()
+            )) {
+                handler.postDelayed(this::verifySent, 750L);
+                return;
+            }
+        }
+
+        // 仅在没有识别到明确“发送”语义时才使用右下角兜底。
         AccessibilityNodeInfo rightButton =
                 findRightmostComposerButton(root);
 
         if (rightButton != null
-                && clickNodeOrParent(rightButton)) {
-            handler.postDelayed(this::verifySent, 700L);
+                && clickExactTarget(rightButton)) {
+            handler.postDelayed(this::verifySent, 750L);
         }
+    }
+
+    private AccessibilityNodeInfo findClickableContainerForNode(
+            AccessibilityNodeInfo root,
+            AccessibilityNodeInfo semanticNode
+    ) {
+        Rect target = new Rect();
+        semanticNode.getBoundsInScreen(target);
+
+        if (target.isEmpty()) return null;
+
+        float cx = target.exactCenterX();
+        float cy = target.exactCenterY();
+
+        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
+        queue.add(root);
+
+        AccessibilityNodeInfo best = null;
+        long bestArea = Long.MAX_VALUE;
+
+        while (!queue.isEmpty()) {
+            AccessibilityNodeInfo node = queue.removeFirst();
+
+            if (node.isVisibleToUser()
+                    && (node.isClickable()
+                    || hasClickableParent(node))) {
+
+                Rect r = new Rect();
+                node.getBoundsInScreen(r);
+
+                if (!r.isEmpty()
+                        && r.contains((int) cx, (int) cy)) {
+
+                    long area =
+                            (long) r.width() * (long) r.height();
+
+                    if (area < bestArea) {
+                        best = node;
+                        bestArea = area;
+                    }
+                }
+            }
+
+            addChildren(queue, node);
+        }
+
+        return best;
+    }
+
+    private boolean clickExactTarget(
+            AccessibilityNodeInfo node
+    ) {
+        if (node == null) return false;
+
+        try {
+            if (node.isClickable()
+                    && node.performAction(
+                    AccessibilityNodeInfo.ACTION_CLICK
+            )) {
+                return true;
+            }
+        } catch (Exception ignored) {}
+
+        Rect r = new Rect();
+        node.getBoundsInScreen(r);
+
+        if (r.isEmpty()) return false;
+
+        return clickAt(
+                r.exactCenterX(),
+                r.exactCenterY()
+        );
     }
 
     private AccessibilityNodeInfo findSemanticSendCandidate(
@@ -779,7 +877,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         StringBuilder out = new StringBuilder();
 
         out.append(
-                "========== 问问 v1.5 DeepSeek 诊断 ==========\n"
+                "========== 问问 v1.6 DeepSeek 诊断 ==========\n"
         );
         out.append("text=").append(activeText).append("\n");
         out.append("inputStage=").append(inputStage).append("\n");
