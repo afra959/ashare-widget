@@ -6,16 +6,21 @@ import android.content.ClipboardManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Typeface;
 import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
 import android.media.session.PlaybackState;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
+import android.view.Gravity;
+import android.view.View;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.List;
@@ -23,9 +28,10 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private static final String TARGET_PACKAGE = "com.netease.cloudmusic";
+    private static final String PREFS = "music_diag";
+    private static final String KEY_PENDING = "pending";
+    private static final String KEY_STARTED = "started";
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private final StringBuilder log = new StringBuilder();
     private ComponentName listenerComponent;
 
     @Override
@@ -37,16 +43,10 @@ public class MainActivity extends Activity {
                 MusicNotificationListenerService.class
         );
 
-        log.append("========== 音乐 v1.6 诊断 ==========\n");
-        log.append("notification_access=").append(isNotificationAccessEnabled()).append("\n");
-        log.append("listener_instance=")
-                .append(MusicNotificationListenerService.instance != null)
-                .append("\n");
-
         if (!isNotificationAccessEnabled()) {
             Toast.makeText(
                     this,
-                    "请先开启“音乐媒体控制”的通知使用权",
+                    "请开启“音乐媒体控制”的通知使用权",
                     Toast.LENGTH_LONG
             ).show();
 
@@ -60,12 +60,37 @@ public class MainActivity extends Activity {
             return;
         }
 
+        boolean pending = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(KEY_PENDING, false);
+
+        long started = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getLong(KEY_STARTED, 0L);
+
+        long age = System.currentTimeMillis() - started;
+
+        if (pending && age >= 1500L && age <= 120000L) {
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(KEY_PENDING, false)
+                    .apply();
+
+            String report = buildReport(age);
+            copyReport(report);
+            showReport(report);
+            return;
+        }
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_PENDING, true)
+                .putLong(KEY_STARTED, System.currentTimeMillis())
+                .apply();
+
         Intent launchIntent = getPackageManager().getLaunchIntentForPackage(TARGET_PACKAGE);
 
-        log.append("launchIntent=").append(launchIntent != null).append("\n");
-
         if (launchIntent == null) {
-            copyAndFinish();
+            Toast.makeText(this, "未找到网易云音乐", Toast.LENGTH_SHORT).show();
+            finish();
             return;
         }
 
@@ -74,39 +99,55 @@ public class MainActivity extends Activity {
                         | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
         );
 
+        Toast.makeText(
+                this,
+                "已开始诊断：等约 3 秒后再点一次“音乐”",
+                Toast.LENGTH_LONG
+        ).show();
+
         startActivity(launchIntent);
-
-        handler.postDelayed(() -> inspectRound("R1-800ms"), 800L);
-        handler.postDelayed(() -> inspectRound("R2-1800ms"), 1800L);
-        handler.postDelayed(() -> inspectRound("R3-3200ms"), 3200L);
-        handler.postDelayed(() -> inspectRound("R4-5000ms"), 5000L);
-
-        handler.postDelayed(this::copyAndFinish, 5800L);
+        finish();
     }
 
-    private void inspectRound(String label) {
-        log.append("\n--- ").append(label).append(" ---\n");
+    private String buildReport(long ageMs) {
+        StringBuilder log = new StringBuilder();
 
-        AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
-
-        if (am != null) {
-            log.append("isMusicActive=").append(am.isMusicActive()).append("\n");
-        }
-
-        inspectSessions();
+        log.append("========== 音乐 v1.7 诊断 ==========\n");
+        log.append("second_launch_age_ms=").append(ageMs).append("\n");
+        log.append("notification_access=")
+                .append(isNotificationAccessEnabled())
+                .append("\n");
 
         MusicNotificationListenerService service =
                 MusicNotificationListenerService.instance;
 
-        log.append("listener_instance_now=").append(service != null).append("\n");
+        log.append("listener_instance=")
+                .append(service != null)
+                .append("\n");
+
+        AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+
+        log.append("isMusicActive=")
+                .append(am != null && am.isMusicActive())
+                .append("\n");
+
+        log.append("\n--- MediaSession ---\n");
+        inspectSessions(log);
+
+        log.append("\n--- Notifications ---\n");
 
         if (service != null) {
-            String notifResult = service.inspectAndTryNotification(TARGET_PACKAGE);
-            log.append(notifResult);
+            log.append(service.inspectNotifications(TARGET_PACKAGE));
+        } else {
+            log.append("listener_instance=null\n");
         }
+
+        log.append("========== 诊断结束 ==========\n");
+
+        return log.toString();
     }
 
-    private void inspectSessions() {
+    private void inspectSessions(StringBuilder log) {
         try {
             MediaSessionManager manager =
                     (MediaSessionManager) getSystemService(MEDIA_SESSION_SERVICE);
@@ -119,7 +160,13 @@ public class MainActivity extends Activity {
             List<MediaController> controllers =
                     manager.getActiveSessions(listenerComponent);
 
-            log.append("session_count=").append(controllers.size()).append("\n");
+            log.append("session_count=")
+                    .append(controllers == null ? 0 : controllers.size())
+                    .append("\n");
+
+            if (controllers == null) {
+                return;
+            }
 
             for (int i = 0; i < controllers.size(); i++) {
                 MediaController c = controllers.get(i);
@@ -128,51 +175,101 @@ public class MainActivity extends Activity {
                     continue;
                 }
 
-                String pkg = c.getPackageName();
                 PlaybackState state = c.getPlaybackState();
                 MediaMetadata meta = c.getMetadata();
 
-                log.append("SESSION#").append(i)
-                        .append(" pkg=").append(pkg);
+                log.append("SESSION#")
+                        .append(i)
+                        .append(" pkg=")
+                        .append(c.getPackageName());
 
                 if (state != null) {
-                    log.append(" state=").append(state.getState())
-                            .append(" actions=").append(state.getActions());
+                    log.append(" state=")
+                            .append(state.getState())
+                            .append(" actions=")
+                            .append(state.getActions())
+                            .append(" position=")
+                            .append(state.getPosition());
                 } else {
                     log.append(" state=null");
                 }
 
                 if (meta != null) {
-                    CharSequence title =
-                            meta.getText(MediaMetadata.METADATA_KEY_TITLE);
-                    CharSequence artist =
-                            meta.getText(MediaMetadata.METADATA_KEY_ARTIST);
-
-                    log.append(" title=").append(title)
-                            .append(" artist=").append(artist);
+                    log.append(" title=")
+                            .append(meta.getText(MediaMetadata.METADATA_KEY_TITLE))
+                            .append(" artist=")
+                            .append(meta.getText(MediaMetadata.METADATA_KEY_ARTIST));
                 }
 
                 log.append("\n");
-
-                if (TARGET_PACKAGE.equals(pkg)) {
-                    try {
-                        MediaController.TransportControls controls =
-                                c.getTransportControls();
-
-                        if (controls != null) {
-                            controls.play();
-                            log.append("  -> controls.play() CALLED\n");
-                        }
-                    } catch (Exception e) {
-                        log.append("  -> controls.play() ERROR ").append(e).append("\n");
-                    }
-                }
             }
 
         } catch (SecurityException e) {
             log.append("session_security_error=").append(e).append("\n");
         } catch (Exception e) {
             log.append("session_error=").append(e).append("\n");
+        }
+    }
+
+    private void showReport(final String report) {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(36, 36, 36, 36);
+
+        TextView title = new TextView(this);
+        title.setText("音乐诊断结果");
+        title.setTextSize(24f);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setPadding(0, 0, 0, 20);
+        root.addView(title);
+
+        TextView tip = new TextView(this);
+        tip.setText("日志已自动复制。也可以点下面的按钮再复制一次。");
+        tip.setTextSize(15f);
+        tip.setPadding(0, 0, 0, 18);
+        root.addView(tip);
+
+        Button copy = new Button(this);
+        copy.setText("复制全部日志");
+        copy.setOnClickListener(v -> {
+            copyReport(report);
+            Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show();
+        });
+        root.addView(copy);
+
+        TextView body = new TextView(this);
+        body.setText(report);
+        body.setTextSize(13f);
+        body.setTypeface(Typeface.MONOSPACE);
+        body.setTextIsSelectable(true);
+        body.setPadding(0, 20, 0, 40);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(body);
+
+        root.addView(
+                scroll,
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        0,
+                        1f
+                )
+        );
+
+        setContentView(root);
+    }
+
+    private void copyReport(String report) {
+        try {
+            ClipboardManager cm =
+                    (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+
+            if (cm != null) {
+                cm.setPrimaryClip(
+                        ClipData.newPlainText("音乐诊断日志", report)
+                );
+            }
+        } catch (Exception ignored) {
         }
     }
 
@@ -201,35 +298,5 @@ public class MainActivity extends Activity {
         }
 
         return false;
-    }
-
-    private void copyAndFinish() {
-        log.append("\n========== 诊断结束 ==========\n");
-
-        try {
-            ClipboardManager cm =
-                    (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-
-            if (cm != null) {
-                cm.setPrimaryClip(
-                        ClipData.newPlainText("音乐诊断日志", log.toString())
-                );
-            }
-        } catch (Exception ignored) {
-        }
-
-        Toast.makeText(
-                this,
-                "诊断完成，日志已复制到剪贴板",
-                Toast.LENGTH_LONG
-        ).show();
-
-        finish();
-    }
-
-    @Override
-    protected void onDestroy() {
-        handler.removeCallbacksAndMessages(null);
-        super.onDestroy();
     }
 }
