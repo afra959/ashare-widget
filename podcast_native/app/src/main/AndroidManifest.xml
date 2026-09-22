@@ -8,7 +8,7 @@
     <application
         android:icon="@drawable/ic_podcast"
         android:allowBackup="false"
-        android:label="播客"
+        android:label="播播"
         android:supportsRtl="true">
 
         <activity
@@ -23,16 +23,13 @@
         </activity>
 
         <service
-            android:name=".PodcastAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="false"
-            android:label="播客快捷播放">
+            android:name=".PodcastNotificationListenerService"
+            android:label="播播媒体控制"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true">
             <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
+                <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
         </service>
 
     </application>
