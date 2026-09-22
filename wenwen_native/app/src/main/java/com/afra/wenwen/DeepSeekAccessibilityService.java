@@ -25,7 +25,6 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayDeque;
-import java.util.Locale;
 
 public class DeepSeekAccessibilityService extends AccessibilityService {
 
@@ -38,41 +37,42 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
     private static final String KEY_AUTOSTART = "pending_autostart";
     private static final String KEY_LAST_DIAG = "last_diag";
 
-    private static final String PLACEHOLDER_CN = "发消息或按住说话";
+    private static final String PLACEHOLDER = "发消息或按住说话";
+
+    private static final int STATE_WAIT_ROOT = 0;
+    private static final int STATE_WAIT_EDIT = 1;
+    private static final int STATE_WAIT_SEND = 2;
+    private static final int STATE_VERIFY = 3;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private String activeText = "";
     private boolean automationRunning = false;
-    private int inputStage = 0;
+    private int state = STATE_WAIT_ROOT;
+    private int sendAttempts = 0;
+    private long startedAt = 0L;
 
     private WindowManager windowManager;
     private android.view.View diagnosticOverlay;
+
+    private final Runnable stepRunnable = this::step;
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        handler.postDelayed(this::resumeQueuedTask, 120L);
+        handler.postDelayed(this::resumeQueuedTask, 80L);
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (!automationRunning) return;
-
-        if (event != null
-                && event.getPackageName() != null
-                && TARGET_PACKAGE.contentEquals(event.getPackageName())) {
-            handler.removeCallbacks(pollRunnable);
-            handler.postDelayed(pollRunnable, 100L);
-        }
+        // 不再由事件驱动整个流程，避免键盘/输入变化导致重复执行。
     }
 
     @Override
     public void onInterrupt() {
-        handler.removeCallbacksAndMessages(null);
-        automationRunning = false;
+        stopAutomation();
     }
 
     @Override
@@ -118,21 +118,12 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
 
         activeText = text;
         automationRunning = true;
-        inputStage = 0;
+        state = STATE_WAIT_ROOT;
+        sendAttempts = 0;
+        startedAt = System.currentTimeMillis();
 
-        putTextOnClipboard(activeText);
         launchDeepSeekNormally();
-
-        int[] delays = new int[]{
-                450, 850, 1300, 1900,
-                2700, 3700, 5000, 6500
-        };
-
-        for (int delay : delays) {
-            handler.postDelayed(this::pollAndAutomate, delay);
-        }
-
-        handler.postDelayed(this::finalFailureCheck, 8000L);
+        handler.postDelayed(stepRunnable, 180L);
     }
 
     private void launchDeepSeekNormally() {
@@ -142,287 +133,195 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                             .getLaunchIntentForPackage(TARGET_PACKAGE);
 
             if (launch == null) {
-                showFailureOverlay(
-                        "未找到 DeepSeek",
-                        "package=" + TARGET_PACKAGE
-                );
-                automationRunning = false;
+                fail("未找到 DeepSeek");
                 return;
             }
 
             launch.addFlags(
                     Intent.FLAG_ACTIVITY_NEW_TASK
                             | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                            | Intent.FLAG_ACTIVITY_NO_ANIMATION
             );
 
             startActivity(launch);
 
         } catch (Exception e) {
-            showFailureOverlay(
-                    "无法打开 DeepSeek",
-                    String.valueOf(e)
-            );
-            automationRunning = false;
+            fail("无法打开 DeepSeek：" + e);
         }
     }
 
-    private final Runnable pollRunnable = this::pollAndAutomate;
-
-    private void pollAndAutomate() {
+    private void step() {
         if (!automationRunning || !isPending()) return;
 
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (!isDeepSeekRoot(root)) return;
-
-        if (isTextVisibleInComposer(root, activeText)) {
-            trySendNow(root);
+        if (System.currentTimeMillis() - startedAt > 5200L) {
+            failWithDiagnostic();
             return;
         }
 
-        AccessibilityNodeInfo editable = findEditableAfterFocus(root);
+        AccessibilityNodeInfo root = getRootInActiveWindow();
 
-        if (editable != null) {
-            if (writeToEditable(editable, activeText)) {
-                handler.postDelayed(this::pollAndAutomate, 250L);
+        if (!isDeepSeekRoot(root)) {
+            scheduleNext(120L);
+            return;
+        }
+
+        if (state == STATE_WAIT_ROOT) {
+            AccessibilityNodeInfo edit = findComposerEditText(root);
+
+            if (edit != null) {
+                state = STATE_WAIT_SEND;
+                writeText(edit);
+                scheduleNext(90L);
                 return;
             }
-        }
 
-        AccessibilityNodeInfo placeholder = findComposerPlaceholder(root);
+            AccessibilityNodeInfo placeholder =
+                    findExactText(root, PLACEHOLDER);
 
-        if (placeholder == null) {
-            return;
-        }
+            if (placeholder != null) {
+                Rect r = new Rect();
+                placeholder.getBoundsInScreen(r);
 
-        Rect bounds = new Rect();
-        placeholder.getBoundsInScreen(bounds);
+                if (!r.isEmpty()) {
+                    clickAt(
+                            r.exactCenterX(),
+                            r.exactCenterY()
+                    );
 
-        if (bounds.isEmpty()) return;
-
-        if (inputStage == 0) {
-            // Real tree shows the composer is a non-editable TextView.
-            // Tap it first so DeepSeek enters editing mode.
-            inputStage = 1;
-            clickAt(bounds.exactCenterX(), bounds.exactCenterY());
-            handler.postDelayed(this::pollAndAutomate, 320L);
-            return;
-        }
-
-        if (inputStage == 1) {
-            // After focus, try ACTION_PASTE on the focused/new input or placeholder.
-            inputStage = 2;
-
-            AccessibilityNodeInfo focused =
-                    root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-
-            boolean pasted = false;
-
-            if (focused != null) {
-                pasted = tryPaste(focused);
-            }
-
-            if (!pasted) {
-                pasted = tryPaste(placeholder);
-            }
-
-            handler.postDelayed(this::pollAndAutomate, 350L);
-            return;
-        }
-
-        if (inputStage == 2) {
-            // Last safe input fallback: long-press the known composer,
-            // then choose the system "Paste" action if it appears.
-            inputStage = 3;
-            longPressAt(bounds.exactCenterX(), bounds.exactCenterY(), 620L);
-            handler.postDelayed(this::clickPastePopupIfPresent, 380L);
-            return;
-        }
-    }
-
-    private void clickPastePopupIfPresent() {
-        if (!automationRunning || !isPending()) return;
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
-
-        AccessibilityNodeInfo paste = findByExactTextOrDesc(root, "粘贴");
-        if (paste == null) {
-            paste = findByExactTextOrDesc(root, "Paste");
-        }
-
-        if (paste != null) {
-            clickNodeOrParent(paste);
-        }
-
-        handler.postDelayed(this::pollAndAutomate, 350L);
-    }
-
-    private AccessibilityNodeInfo findComposerPlaceholder(
-            AccessibilityNodeInfo root
-    ) {
-        AccessibilityNodeInfo exact =
-                findByExactTextOrDesc(root, PLACEHOLDER_CN);
-
-        if (exact != null) return exact;
-
-        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
-        queue.add(root);
-
-        int screenHeight =
-                getResources().getDisplayMetrics().heightPixels;
-
-        AccessibilityNodeInfo best = null;
-        int bestScore = Integer.MIN_VALUE;
-
-        while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node = queue.removeFirst();
-
-            Rect r = new Rect();
-            node.getBoundsInScreen(r);
-
-            String text = safe(node.getText());
-            String hint = safe(node.getHintText());
-            String desc = safe(node.getContentDescription());
-
-            String joined = (text + " " + hint + " " + desc)
-                    .toLowerCase(Locale.ROOT);
-
-            int score = 0;
-
-            if (joined.contains("发消息")
-                    || joined.contains("按住说话")
-                    || joined.contains("message")) {
-                score += 220;
-            }
-
-            if (!r.isEmpty()
-                    && r.centerY() > screenHeight * 0.72f) {
-                score += 70;
-            }
-
-            if (r.width()
-                    > getResources().getDisplayMetrics().widthPixels * 0.55f) {
-                score += 35;
-            }
-
-            if (score > bestScore) {
-                best = node;
-                bestScore = score;
-            }
-
-            addChildren(queue, node);
-        }
-
-        return bestScore >= 200 ? best : null;
-    }
-
-    private AccessibilityNodeInfo findEditableAfterFocus(
-            AccessibilityNodeInfo root
-    ) {
-        AccessibilityNodeInfo focused =
-                root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-
-        if (focused != null
-                && (focused.isEditable()
-                || hasSetTextAction(focused))) {
-            return focused;
-        }
-
-        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
-        queue.add(root);
-
-        int screenHeight =
-                getResources().getDisplayMetrics().heightPixels;
-
-        AccessibilityNodeInfo best = null;
-        int bestScore = Integer.MIN_VALUE;
-
-        while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node = queue.removeFirst();
-
-            Rect r = new Rect();
-            node.getBoundsInScreen(r);
-
-            String cls = safe(node.getClassName())
-                    .toLowerCase(Locale.ROOT);
-
-            int score = 0;
-
-            if (node.isEditable()) score += 180;
-            if (hasSetTextAction(node)) score += 150;
-            if (cls.contains("edittext")) score += 120;
-            if (node.isFocused()) score += 80;
-
-            if (!r.isEmpty()
-                    && r.centerY() > screenHeight * 0.55f) {
-                score += 50;
-            }
-
-            if ((node.isEditable()
-                    || hasSetTextAction(node)
-                    || cls.contains("edittext"))
-                    && score > bestScore) {
-                best = node;
-                bestScore = score;
-            }
-
-            addChildren(queue, node);
-        }
-
-        return best;
-    }
-
-    private boolean writeToEditable(
-            AccessibilityNodeInfo node,
-            String text
-    ) {
-        try {
-            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-        } catch (Exception ignored) {}
-
-        if (hasSetTextAction(node)) {
-            try {
-                Bundle args = new Bundle();
-                args.putCharSequence(
-                        AccessibilityNodeInfo
-                                .ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                        text
-                );
-
-                if (node.performAction(
-                        AccessibilityNodeInfo.ACTION_SET_TEXT,
-                        args
-                )) {
-                    return true;
+                    state = STATE_WAIT_EDIT;
+                    scheduleNext(120L);
+                    return;
                 }
-            } catch (Exception ignored) {}
+            }
+
+            scheduleNext(100L);
+            return;
         }
 
-        return tryPaste(node);
+        if (state == STATE_WAIT_EDIT) {
+            AccessibilityNodeInfo edit = findComposerEditText(root);
+
+            if (edit == null) {
+                scheduleNext(100L);
+                return;
+            }
+
+            if (!writeText(edit)) {
+                scheduleNext(120L);
+                return;
+            }
+
+            state = STATE_WAIT_SEND;
+            scheduleNext(90L);
+            return;
+        }
+
+        if (state == STATE_WAIT_SEND) {
+            AccessibilityNodeInfo edit = findComposerEditText(root);
+
+            if (edit == null) {
+                scheduleNext(100L);
+                return;
+            }
+
+            String current = safe(edit.getText()).trim();
+
+            if (!activeText.equals(current)) {
+                if (!writeText(edit)) {
+                    scheduleNext(120L);
+                    return;
+                }
+
+                scheduleNext(90L);
+                return;
+            }
+
+            AccessibilityNodeInfo send =
+                    findExactDesc(root, "发送");
+
+            if (send == null) {
+                scheduleNext(100L);
+                return;
+            }
+
+            Rect r = new Rect();
+            send.getBoundsInScreen(r);
+
+            if (r.isEmpty()) {
+                scheduleNext(100L);
+                return;
+            }
+
+            // 真实日志已经确认这个 bounds 就是蓝色上箭头本身。
+            // 不再先点外层 Compose 容器。
+            clickAt(
+                    r.exactCenterX(),
+                    r.exactCenterY()
+            );
+
+            sendAttempts++;
+            state = STATE_VERIFY;
+            scheduleNext(360L);
+            return;
+        }
+
+        if (state == STATE_VERIFY) {
+            AccessibilityNodeInfo edit = findComposerEditText(root);
+
+            if (edit == null
+                    || !activeText.equals(
+                    safe(edit.getText()).trim()
+            )) {
+                finishSuccess();
+                return;
+            }
+
+            if (sendAttempts < 2) {
+                state = STATE_WAIT_SEND;
+                scheduleNext(80L);
+                return;
+            }
+
+            failWithDiagnostic();
+        }
     }
 
-    private boolean tryPaste(AccessibilityNodeInfo node) {
-        if (node == null) return false;
+    private boolean writeText(AccessibilityNodeInfo edit) {
+        if (edit == null) return false;
+
+        String current = safe(edit.getText()).trim();
+
+        if (activeText.equals(current)) return true;
 
         try {
-            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            edit.performAction(
+                    AccessibilityNodeInfo.ACTION_FOCUS
+            );
         } catch (Exception ignored) {}
 
         try {
-            putTextOnClipboard(activeText);
-            return node.performAction(
-                    AccessibilityNodeInfo.ACTION_PASTE
+            Bundle args = new Bundle();
+
+            args.putCharSequence(
+                    AccessibilityNodeInfo
+                            .ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                    activeText
             );
+
+            return edit.performAction(
+                    AccessibilityNodeInfo.ACTION_SET_TEXT,
+                    args
+            );
+
         } catch (Exception ignored) {
             return false;
         }
     }
 
-    private boolean isTextVisibleInComposer(
-            AccessibilityNodeInfo root,
-            String text
+    private AccessibilityNodeInfo findComposerEditText(
+            AccessibilityNodeInfo root
     ) {
-        if (text == null || text.isEmpty()) return false;
+        if (root == null) return null;
 
         int screenHeight =
                 getResources().getDisplayMetrics().heightPixels;
@@ -430,112 +329,35 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
         queue.add(root);
 
+        AccessibilityNodeInfo best = null;
+        int bestScore = Integer.MIN_VALUE;
+
         while (!queue.isEmpty()) {
             AccessibilityNodeInfo node = queue.removeFirst();
 
             Rect r = new Rect();
             node.getBoundsInScreen(r);
 
-            String nodeText = safe(node.getText()).trim();
+            String cls = safe(node.getClassName());
+            String hint = safe(node.getHintText());
 
-            if (text.equals(nodeText)
-                    && !r.isEmpty()
-                    && r.centerY() > screenHeight * 0.55f) {
-                return true;
+            int score = 0;
+
+            if ("android.widget.EditText".equals(cls)) score += 200;
+            if (node.isEditable()) score += 150;
+            if ("发消息".equals(hint)) score += 180;
+            if (node.isFocused()) score += 40;
+
+            if (!r.isEmpty()
+                    && r.centerY() > screenHeight * 0.45f) {
+                score += 50;
             }
 
-            addChildren(queue, node);
-        }
-
-        return false;
-    }
-
-    private void trySendNow(AccessibilityNodeInfo root) {
-        if (!automationRunning || !isPending()) return;
-
-        // 当前 DeepSeek 真实树已确认会出现 desc=发送 的语义节点，
-        // 但该节点本身 clickable=false。
-        AccessibilityNodeInfo sendSemantic =
-                findByExactTextOrDesc(root, "发送");
-
-        if (sendSemantic == null) {
-            sendSemantic = findSemanticSendCandidate(root);
-        }
-
-        if (sendSemantic != null) {
-            AccessibilityNodeInfo hitTarget =
-                    findClickableContainerForNode(root, sendSemantic);
-
-            if (hitTarget != null) {
-                if (clickExactTarget(hitTarget)) {
-                    handler.postDelayed(this::verifySent, 750L);
-                    return;
-                }
-            }
-
-            // 最后直接点“发送”语义节点自身的可视中心。
-            Rect semanticBounds = new Rect();
-            sendSemantic.getBoundsInScreen(semanticBounds);
-
-            if (!semanticBounds.isEmpty()
-                    && clickAt(
-                    semanticBounds.exactCenterX(),
-                    semanticBounds.exactCenterY()
-            )) {
-                handler.postDelayed(this::verifySent, 750L);
-                return;
-            }
-        }
-
-        // 仅在没有识别到明确“发送”语义时才使用右下角兜底。
-        AccessibilityNodeInfo rightButton =
-                findRightmostComposerButton(root);
-
-        if (rightButton != null
-                && clickExactTarget(rightButton)) {
-            handler.postDelayed(this::verifySent, 750L);
-        }
-    }
-
-    private AccessibilityNodeInfo findClickableContainerForNode(
-            AccessibilityNodeInfo root,
-            AccessibilityNodeInfo semanticNode
-    ) {
-        Rect target = new Rect();
-        semanticNode.getBoundsInScreen(target);
-
-        if (target.isEmpty()) return null;
-
-        float cx = target.exactCenterX();
-        float cy = target.exactCenterY();
-
-        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
-        queue.add(root);
-
-        AccessibilityNodeInfo best = null;
-        long bestArea = Long.MAX_VALUE;
-
-        while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node = queue.removeFirst();
-
-            if (node.isVisibleToUser()
-                    && (node.isClickable()
-                    || hasClickableParent(node))) {
-
-                Rect r = new Rect();
-                node.getBoundsInScreen(r);
-
-                if (!r.isEmpty()
-                        && r.contains((int) cx, (int) cy)) {
-
-                    long area =
-                            (long) r.width() * (long) r.height();
-
-                    if (area < bestArea) {
-                        best = node;
-                        bestArea = area;
-                    }
-                }
+            if (score > bestScore
+                    && ("android.widget.EditText".equals(cls)
+                    || node.isEditable())) {
+                best = node;
+                bestScore = score;
             }
 
             addChildren(queue, node);
@@ -544,184 +366,11 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         return best;
     }
 
-    private boolean clickExactTarget(
-            AccessibilityNodeInfo node
-    ) {
-        if (node == null) return false;
-
-        try {
-            if (node.isClickable()
-                    && node.performAction(
-                    AccessibilityNodeInfo.ACTION_CLICK
-            )) {
-                return true;
-            }
-        } catch (Exception ignored) {}
-
-        Rect r = new Rect();
-        node.getBoundsInScreen(r);
-
-        if (r.isEmpty()) return false;
-
-        return clickAt(
-                r.exactCenterX(),
-                r.exactCenterY()
-        );
-    }
-
-    private AccessibilityNodeInfo findSemanticSendCandidate(
-            AccessibilityNodeInfo root
-    ) {
-        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
-        queue.add(root);
-
-        AccessibilityNodeInfo best = null;
-        int bestScore = Integer.MIN_VALUE;
-
-        while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node = queue.removeFirst();
-
-            String text = safe(node.getText()).trim();
-            String desc = safe(node.getContentDescription()).trim();
-            String id = safe(node.getViewIdResourceName());
-
-            String joined = (id + " " + text + " " + desc)
-                    .toLowerCase(Locale.ROOT);
-
-            int score = 0;
-
-            if ("发送".equals(text)
-                    || "发送".equals(desc)
-                    || "send".equalsIgnoreCase(text)
-                    || "send".equalsIgnoreCase(desc)
-                    || "发送消息".equals(text)
-                    || "发送消息".equals(desc)) {
-                score += 300;
-            }
-
-            if (joined.contains("send")
-                    || joined.contains("发送")
-                    || joined.contains("submit")) {
-                score += 220;
-            }
-
-            if (joined.contains("voice")
-                    || joined.contains("语音")
-                    || joined.contains("麦克风")
-                    || joined.contains("上传")
-                    || joined.contains("附件")) {
-                score -= 500;
-            }
-
-            if ((node.isClickable()
-                    || hasClickableParent(node))
-                    && score > bestScore) {
-                best = node;
-                bestScore = score;
-            }
-
-            addChildren(queue, node);
-        }
-
-        return bestScore >= 220 ? best : null;
-    }
-
-    private AccessibilityNodeInfo findRightmostComposerButton(
-            AccessibilityNodeInfo root
-    ) {
-        int screenWidth =
-                getResources().getDisplayMetrics().widthPixels;
-        int screenHeight =
-                getResources().getDisplayMetrics().heightPixels;
-
-        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
-        queue.add(root);
-
-        AccessibilityNodeInfo best = null;
-        int bestScore = Integer.MIN_VALUE;
-
-        while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node = queue.removeFirst();
-
-            if (node.isVisibleToUser()
-                    && (node.isClickable()
-                    || hasClickableParent(node))) {
-
-                Rect r = new Rect();
-                node.getBoundsInScreen(r);
-
-                if (!r.isEmpty()) {
-                    String joined = (
-                            safe(node.getText()) + " "
-                                    + safe(node.getContentDescription()) + " "
-                                    + safe(node.getViewIdResourceName())
-                    ).toLowerCase(Locale.ROOT);
-
-                    int score = 0;
-
-                    if (r.centerY() > screenHeight * 0.72f) score += 80;
-                    if (r.centerX() > screenWidth * 0.78f) score += 90;
-
-                    if (r.width() < screenWidth * 0.22f
-                            && r.height() < screenHeight * 0.14f) {
-                        score += 50;
-                    }
-
-                    if (joined.contains("上传")
-                            || joined.contains("附件")
-                            || joined.contains("深度思考")
-                            || joined.contains("智能搜索")) {
-                        score -= 500;
-                    }
-
-                    // When text is already confirmed in composer, DeepSeek
-                    // replaces the voice toggle at the far right with send.
-                    if (score > bestScore) {
-                        best = node;
-                        bestScore = score;
-                    }
-                }
-            }
-
-            addChildren(queue, node);
-        }
-
-        return bestScore >= 190 ? best : null;
-    }
-
-    private void verifySent() {
-        if (!automationRunning || !isPending()) return;
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-
-        if (root == null
-                || !isTextVisibleInComposer(root, activeText)) {
-            finishSuccess();
-        }
-    }
-
-    private void finalFailureCheck() {
-        if (!automationRunning || !isPending()) return;
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        String diag = buildDiagnostic(root);
-
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_LAST_DIAG, diag)
-                .apply();
-
-        showFailureOverlay(
-                "问问没有完成自动输入",
-                diag
-        );
-    }
-
-    private AccessibilityNodeInfo findByExactTextOrDesc(
+    private AccessibilityNodeInfo findExactText(
             AccessibilityNodeInfo root,
             String target
     ) {
-        if (root == null || target == null) return null;
+        if (root == null) return null;
 
         ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
         queue.add(root);
@@ -729,8 +378,29 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         while (!queue.isEmpty()) {
             AccessibilityNodeInfo node = queue.removeFirst();
 
-            if (target.equals(safe(node.getText()).trim())
-                    || target.equals(
+            if (target.equals(safe(node.getText()).trim())) {
+                return node;
+            }
+
+            addChildren(queue, node);
+        }
+
+        return null;
+    }
+
+    private AccessibilityNodeInfo findExactDesc(
+            AccessibilityNodeInfo root,
+            String target
+    ) {
+        if (root == null) return null;
+
+        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
+        queue.add(root);
+
+        while (!queue.isEmpty()) {
+            AccessibilityNodeInfo node = queue.removeFirst();
+
+            if (target.equals(
                     safe(node.getContentDescription()).trim()
             )) {
                 return node;
@@ -742,48 +412,6 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         return null;
     }
 
-    private boolean clickNodeOrParent(
-            AccessibilityNodeInfo node
-    ) {
-        try {
-            if (node.isClickable()
-                    && node.performAction(
-                    AccessibilityNodeInfo.ACTION_CLICK
-            )) {
-                return true;
-            }
-
-            AccessibilityNodeInfo parent = node.getParent();
-
-            for (int depth = 0;
-                 parent != null && depth < 4;
-                 depth++) {
-
-                if (parent.isClickable()
-                        && parent.performAction(
-                        AccessibilityNodeInfo.ACTION_CLICK
-                )) {
-                    return true;
-                }
-
-                parent = parent.getParent();
-            }
-
-            Rect r = new Rect();
-            node.getBoundsInScreen(r);
-
-            if (!r.isEmpty()) {
-                return clickAt(
-                        r.exactCenterX(),
-                        r.exactCenterY()
-                );
-            }
-
-        } catch (Exception ignored) {}
-
-        return false;
-    }
-
     private boolean clickAt(float x, float y) {
         try {
             Path path = new Path();
@@ -793,7 +421,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                     new GestureDescription.StrokeDescription(
                             path,
                             0L,
-                            70L
+                            55L
                     );
 
             GestureDescription gesture =
@@ -801,70 +429,20 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                             .addStroke(stroke)
                             .build();
 
-            return dispatchGesture(gesture, null, null);
+            return dispatchGesture(
+                    gesture,
+                    null,
+                    null
+            );
 
         } catch (Exception ignored) {
             return false;
         }
     }
 
-    private boolean longPressAt(
-            float x,
-            float y,
-            long duration
-    ) {
-        try {
-            Path path = new Path();
-            path.moveTo(x, y);
-
-            GestureDescription.StrokeDescription stroke =
-                    new GestureDescription.StrokeDescription(
-                            path,
-                            0L,
-                            duration
-                    );
-
-            GestureDescription gesture =
-                    new GestureDescription.Builder()
-                            .addStroke(stroke)
-                            .build();
-
-            return dispatchGesture(gesture, null, null);
-
-        } catch (Exception ignored) {
-            return false;
-        }
-    }
-
-    private boolean hasSetTextAction(
-            AccessibilityNodeInfo node
-    ) {
-        for (AccessibilityNodeInfo.AccessibilityAction action
-                : node.getActionList()) {
-
-            if (action.getId()
-                    == AccessibilityNodeInfo.ACTION_SET_TEXT) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private boolean hasClickableParent(
-            AccessibilityNodeInfo node
-    ) {
-        AccessibilityNodeInfo parent = node.getParent();
-
-        for (int depth = 0;
-             parent != null && depth < 3;
-             depth++) {
-
-            if (parent.isClickable()) return true;
-            parent = parent.getParent();
-        }
-
-        return false;
+    private void scheduleNext(long delay) {
+        handler.removeCallbacks(stepRunnable);
+        handler.postDelayed(stepRunnable, delay);
     }
 
     private boolean isDeepSeekRoot(AccessibilityNodeInfo root) {
@@ -873,14 +451,61 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 && TARGET_PACKAGE.contentEquals(root.getPackageName());
     }
 
+    private void finishSuccess() {
+        automationRunning = false;
+        handler.removeCallbacksAndMessages(null);
+        hideDiagnosticOverlay();
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_TEXT, "")
+                .putLong(KEY_UNTIL, 0L)
+                .putBoolean(KEY_AUTOSTART, false)
+                .putString(KEY_LAST_DIAG, "")
+                .apply();
+    }
+
+    private void stopAutomation() {
+        automationRunning = false;
+        handler.removeCallbacksAndMessages(null);
+    }
+
+    private void fail(String message) {
+        stopAutomation();
+        Toast.makeText(
+                this,
+                message,
+                Toast.LENGTH_LONG
+        ).show();
+    }
+
+    private void failWithDiagnostic() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        String diag = buildDiagnostic(root);
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_LAST_DIAG, diag)
+                .apply();
+
+        automationRunning = false;
+        handler.removeCallbacksAndMessages(null);
+
+        showFailureOverlay(
+                "问问没有完成自动发送",
+                diag
+        );
+    }
+
     private String buildDiagnostic(AccessibilityNodeInfo root) {
         StringBuilder out = new StringBuilder();
 
         out.append(
-                "========== 问问 v1.6 DeepSeek 诊断 ==========\n"
+                "========== 问问 v1.7 DeepSeek 诊断 ==========\n"
         );
         out.append("text=").append(activeText).append("\n");
-        out.append("inputStage=").append(inputStage).append("\n");
+        out.append("state=").append(state).append("\n");
+        out.append("sendAttempts=").append(sendAttempts).append("\n");
 
         if (root == null) {
             out.append("root=null\n");
@@ -899,21 +524,19 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
 
         int index = 0;
 
-        while (!queue.isEmpty() && index < 240) {
+        while (!queue.isEmpty() && index < 180) {
             AccessibilityNodeInfo node = queue.removeFirst();
 
             Rect r = new Rect();
             node.getBoundsInScreen(r);
 
             if (!r.isEmpty()
-                    && r.bottom >= screenHeight * 0.30f) {
+                    && r.bottom >= screenHeight * 0.35f) {
 
                 out.append("#")
                         .append(index++)
                         .append(" cls=")
                         .append(safe(node.getClassName()))
-                        .append(" id=")
-                        .append(safe(node.getViewIdResourceName()))
                         .append(" text=")
                         .append(safe(node.getText()))
                         .append(" hint=")
@@ -922,14 +545,10 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                         .append(safe(node.getContentDescription()))
                         .append(" editable=")
                         .append(node.isEditable())
-                        .append(" focusable=")
-                        .append(node.isFocusable())
                         .append(" focused=")
                         .append(node.isFocused())
                         .append(" clickable=")
                         .append(node.isClickable())
-                        .append(" actions=")
-                        .append(node.getActions())
                         .append(" bounds=")
                         .append(r.toShortString())
                         .append("\n");
@@ -1105,20 +724,6 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                         .getLong(KEY_UNTIL, 0L);
 
         return System.currentTimeMillis() <= until;
-    }
-
-    private void finishSuccess() {
-        automationRunning = false;
-        handler.removeCallbacksAndMessages(null);
-        hideDiagnosticOverlay();
-
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_TEXT, "")
-                .putLong(KEY_UNTIL, 0L)
-                .putBoolean(KEY_AUTOSTART, false)
-                .putString(KEY_LAST_DIAG, "")
-                .apply();
     }
 
     private void addChildren(
