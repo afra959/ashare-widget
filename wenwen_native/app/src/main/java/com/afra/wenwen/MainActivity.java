@@ -15,9 +15,9 @@ import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.text.TextUtils;
-import android.view.Gravity;
-import android.widget.LinearLayout;
-import android.widget.TextView;
+import android.view.Window;
+import android.view.WindowManager;
+import android.widget.FrameLayout;
 import android.widget.Toast;
 
 import java.util.ArrayList;
@@ -31,45 +31,29 @@ public class MainActivity extends Activity {
     private static final String KEY_UNTIL = "pending_until";
 
     private SpeechRecognizer speechRecognizer;
-    private TextView statusView;
     private boolean resultHandled = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        buildListeningUi();
+
+        Window window = getWindow();
+        window.setDimAmount(0f);
+        window.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
+
+        // 保持 Activity 本身透明；桌面仍然可见。
+        FrameLayout invisibleRoot = new FrameLayout(this);
+        invisibleRoot.setBackgroundColor(Color.TRANSPARENT);
+        setContentView(invisibleRoot);
+
         beginFlow();
-    }
-
-    private void buildListeningUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER);
-        root.setPadding(48, 48, 48, 48);
-        root.setBackgroundColor(Color.rgb(32, 33, 36));
-
-        TextView mic = new TextView(this);
-        mic.setText("●");
-        mic.setTextColor(Color.rgb(246, 242, 234));
-        mic.setTextSize(56f);
-        mic.setGravity(Gravity.CENTER);
-        root.addView(mic);
-
-        statusView = new TextView(this);
-        statusView.setText("准备语音输入…");
-        statusView.setTextColor(Color.rgb(246, 242, 234));
-        statusView.setTextSize(20f);
-        statusView.setGravity(Gravity.CENTER);
-        statusView.setPadding(0, 28, 0, 0);
-        root.addView(statusView);
-
-        setContentView(root);
     }
 
     private void beginFlow() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
-            statusView.setText("需要麦克风权限");
             requestPermissions(
                     new String[]{Manifest.permission.RECORD_AUDIO},
                     REQ_AUDIO
@@ -101,27 +85,31 @@ public class MainActivity extends Activity {
 
     private void startSpeechRecognition() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            statusView.setText("系统没有可用的语音识别服务");
             Toast.makeText(
                     this,
                     "系统没有可用的语音识别服务",
                     Toast.LENGTH_LONG
             ).show();
+            finish();
             return;
         }
 
         resultHandled = false;
 
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
             @Override
             public void onReadyForSpeech(Bundle params) {
-                statusView.setText("正在聆听…");
+                Toast.makeText(
+                        MainActivity.this,
+                        "正在聆听…",
+                        Toast.LENGTH_SHORT
+                ).show();
             }
 
             @Override
             public void onBeginningOfSpeech() {
-                statusView.setText("正在聆听…");
             }
 
             @Override
@@ -134,14 +122,16 @@ public class MainActivity extends Activity {
 
             @Override
             public void onEndOfSpeech() {
-                statusView.setText("正在识别…");
+                Toast.makeText(
+                        MainActivity.this,
+                        "正在识别…",
+                        Toast.LENGTH_SHORT
+                ).show();
             }
 
             @Override
             public void onError(int error) {
-                if (resultHandled) {
-                    return;
-                }
+                if (resultHandled) return;
 
                 String message;
 
@@ -162,15 +152,18 @@ public class MainActivity extends Activity {
                         break;
                 }
 
-                statusView.setText(message);
-                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+                Toast.makeText(
+                        MainActivity.this,
+                        message,
+                        Toast.LENGTH_LONG
+                ).show();
+
+                finish();
             }
 
             @Override
             public void onResults(Bundle results) {
-                if (resultHandled) {
-                    return;
-                }
+                if (resultHandled) return;
 
                 ArrayList<String> list =
                         results.getStringArrayList(
@@ -178,7 +171,12 @@ public class MainActivity extends Activity {
                         );
 
                 if (list == null || list.isEmpty()) {
-                    statusView.setText("没有识别到内容");
+                    Toast.makeText(
+                            MainActivity.this,
+                            "没有识别到内容",
+                            Toast.LENGTH_LONG
+                    ).show();
+                    finish();
                     return;
                 }
 
@@ -192,7 +190,12 @@ public class MainActivity extends Activity {
                 }
 
                 if (text.isEmpty()) {
-                    statusView.setText("没有识别到内容");
+                    Toast.makeText(
+                            MainActivity.this,
+                            "没有识别到内容",
+                            Toast.LENGTH_LONG
+                    ).show();
+                    finish();
                     return;
                 }
 
@@ -209,33 +212,43 @@ public class MainActivity extends Activity {
             }
         });
 
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        Intent intent = new Intent(
+                RecognizerIntent.ACTION_RECOGNIZE_SPEECH
+        );
+
         intent.putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
         );
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN");
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "zh-CN");
-        intent.putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, false);
-        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+        intent.putExtra(
+                RecognizerIntent.EXTRA_LANGUAGE,
+                "zh-CN"
+        );
+        intent.putExtra(
+                RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
+                "zh-CN"
+        );
+        intent.putExtra(
+                RecognizerIntent.EXTRA_PARTIAL_RESULTS,
+                false
+        );
+        intent.putExtra(
+                RecognizerIntent.EXTRA_MAX_RESULTS,
+                3
+        );
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                1100L
+                1050L
         );
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                750L
+                700L
         );
 
-        statusView.setText("正在启动麦克风…");
         speechRecognizer.startListening(intent);
     }
 
     private void sendToDeepSeek(String text) {
-        statusView.setText("已识别：\n" + text + "\n\n正在发送到 DeepSeek…");
-
-        // 无论自动发送是否成功，都先保留一份到剪贴板。
         try {
             ClipboardManager cm =
                     (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
@@ -251,7 +264,7 @@ public class MainActivity extends Activity {
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putString(KEY_TEXT, text)
-                .putLong(KEY_UNTIL, System.currentTimeMillis() + 20000L)
+                .putLong(KEY_UNTIL, System.currentTimeMillis() + 25000L)
                 .apply();
 
         Intent launchIntent =
@@ -263,6 +276,7 @@ public class MainActivity extends Activity {
                     "未找到 DeepSeek，识别结果已复制",
                     Toast.LENGTH_LONG
             ).show();
+            finish();
             return;
         }
 
@@ -279,12 +293,14 @@ public class MainActivity extends Activity {
             Context context,
             Class<?> serviceClass
     ) {
-        ComponentName expected = new ComponentName(context, serviceClass);
+        ComponentName expected =
+                new ComponentName(context, serviceClass);
 
-        String enabledServices = Settings.Secure.getString(
-                context.getContentResolver(),
-                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        );
+        String enabledServices =
+                Settings.Secure.getString(
+                        context.getContentResolver(),
+                        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                );
 
         if (TextUtils.isEmpty(enabledServices)) {
             return false;
@@ -319,20 +335,18 @@ public class MainActivity extends Activity {
                 grantResults
         );
 
-        if (requestCode != REQ_AUDIO) {
-            return;
-        }
+        if (requestCode != REQ_AUDIO) return;
 
         if (grantResults.length > 0
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             continueAfterAudioPermission();
         } else {
-            statusView.setText("麦克风权限被拒绝");
             Toast.makeText(
                     this,
                     "需要麦克风权限才能语音输入",
                     Toast.LENGTH_LONG
             ).show();
+            finish();
         }
     }
 
