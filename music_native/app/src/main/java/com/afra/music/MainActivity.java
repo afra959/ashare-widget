@@ -13,10 +13,11 @@ import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
 import android.media.session.PlaybackState;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
+import android.service.notification.NotificationListenerService;
 import android.text.TextUtils;
-import android.view.Gravity;
-import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -32,6 +33,7 @@ public class MainActivity extends Activity {
     private static final String KEY_PENDING = "pending";
     private static final String KEY_STARTED = "started";
 
+    private final Handler handler = new Handler(Looper.getMainLooper());
     private ComponentName listenerComponent;
 
     @Override
@@ -60,6 +62,11 @@ public class MainActivity extends Activity {
             return;
         }
 
+        try {
+            NotificationListenerService.requestRebind(listenerComponent);
+        } catch (Exception ignored) {
+        }
+
         boolean pending = getSharedPreferences(PREFS, MODE_PRIVATE)
                 .getBoolean(KEY_PENDING, false);
 
@@ -68,18 +75,39 @@ public class MainActivity extends Activity {
 
         long age = System.currentTimeMillis() - started;
 
-        if (pending && age >= 1500L && age <= 120000L) {
+        if (pending) {
+            if (age < 1500L) {
+                showWaitPage(age);
+                return;
+            }
+
+            if (age <= 180000L) {
+                getSharedPreferences(PREFS, MODE_PRIVATE)
+                        .edit()
+                        .putBoolean(KEY_PENDING, false)
+                        .apply();
+
+                showCollectingPage();
+
+                handler.postDelayed(() -> {
+                    String report = buildReport(age);
+                    copyReport(report);
+                    showReport(report);
+                }, 800L);
+
+                return;
+            }
+
             getSharedPreferences(PREFS, MODE_PRIVATE)
                     .edit()
                     .putBoolean(KEY_PENDING, false)
                     .apply();
-
-            String report = buildReport(age);
-            copyReport(report);
-            showReport(report);
-            return;
         }
 
+        startFirstStage();
+    }
+
+    private void startFirstStage() {
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_PENDING, true)
@@ -90,6 +118,12 @@ public class MainActivity extends Activity {
 
         if (launchIntent == null) {
             Toast.makeText(this, "未找到网易云音乐", Toast.LENGTH_SHORT).show();
+
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(KEY_PENDING, false)
+                    .apply();
+
             finish();
             return;
         }
@@ -101,7 +135,7 @@ public class MainActivity extends Activity {
 
         Toast.makeText(
                 this,
-                "已开始诊断：等约 3 秒后再点一次“音乐”",
+                "第一步完成：约 3 秒后回桌面，再点一次“音乐”",
                 Toast.LENGTH_LONG
         ).show();
 
@@ -109,10 +143,45 @@ public class MainActivity extends Activity {
         finish();
     }
 
+    private void showWaitPage(long age) {
+        LinearLayout root = baseLayout();
+
+        TextView title = titleView("还需要稍等");
+        root.addView(title);
+
+        TextView body = new TextView(this);
+        body.setText(
+                "第一次启动距现在只有 " + age + " ms。\n\n" +
+                "请再等约 2 秒，然后回桌面重新点击“音乐”。\n" +
+                "本次不会重置诊断流程，也不会重新打开网易云。"
+        );
+        body.setTextSize(17f);
+        root.addView(body);
+
+        setContentView(root);
+    }
+
+    private void showCollectingPage() {
+        LinearLayout root = baseLayout();
+
+        TextView title = titleView("正在收集诊断信息");
+        root.addView(title);
+
+        TextView body = new TextView(this);
+        body.setText(
+                "正在等待通知监听服务连接，并读取网易云的 MediaSession 和媒体通知。\n\n" +
+                "约 1 秒后会自动显示结果。"
+        );
+        body.setTextSize(17f);
+        root.addView(body);
+
+        setContentView(root);
+    }
+
     private String buildReport(long ageMs) {
         StringBuilder log = new StringBuilder();
 
-        log.append("========== 音乐 v1.7 诊断 ==========\n");
+        log.append("========== 音乐 v1.8 诊断 ==========\n");
         log.append("second_launch_age_ms=").append(ageMs).append("\n");
         log.append("notification_access=")
                 .append(isNotificationAccessEnabled())
@@ -212,19 +281,13 @@ public class MainActivity extends Activity {
     }
 
     private void showReport(final String report) {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(36, 36, 36, 36);
+        LinearLayout root = baseLayout();
 
-        TextView title = new TextView(this);
-        title.setText("音乐诊断结果");
-        title.setTextSize(24f);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setPadding(0, 0, 0, 20);
+        TextView title = titleView("音乐诊断结果");
         root.addView(title);
 
         TextView tip = new TextView(this);
-        tip.setText("日志已自动复制。也可以点下面的按钮再复制一次。");
+        tip.setText("结果已经成功生成，并已自动复制到剪贴板。");
         tip.setTextSize(15f);
         tip.setPadding(0, 0, 0, 18);
         root.addView(tip);
@@ -257,6 +320,22 @@ public class MainActivity extends Activity {
         );
 
         setContentView(root);
+    }
+
+    private LinearLayout baseLayout() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(36, 36, 36, 36);
+        return root;
+    }
+
+    private TextView titleView(String text) {
+        TextView title = new TextView(this);
+        title.setText(text);
+        title.setTextSize(24f);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setPadding(0, 0, 0, 22);
+        return title;
     }
 
     private void copyReport(String report) {
@@ -298,5 +377,11 @@ public class MainActivity extends Activity {
         }
 
         return false;
+    }
+
+    @Override
+    protected void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
+        super.onDestroy();
     }
 }
