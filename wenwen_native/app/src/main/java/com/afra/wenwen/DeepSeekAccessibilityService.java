@@ -6,6 +6,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Path;
 import android.graphics.Rect;
@@ -34,13 +35,13 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
     private static final String PREFS = "wenwen";
     private static final String KEY_TEXT = "pending_text";
     private static final String KEY_UNTIL = "pending_until";
+    private static final String KEY_AUTOSTART = "pending_autostart";
     private static final String KEY_LAST_DIAG = "last_diag";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private String activeText = "";
     private boolean automationRunning = false;
-    private boolean shareIntentSupported = false;
 
     private WindowManager windowManager;
     private android.view.View diagnosticOverlay;
@@ -50,12 +51,13 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         super.onServiceConnected();
         instance = this;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+
+        // 如果 Activity 先保存了任务、Service 后连接，在这里自动续上。
+        handler.postDelayed(this::resumeQueuedTask, 120L);
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        // v1.3 不再依赖事件触发自动化。
-        // 若任务正在进行，事件只用于加速下一次主动检查。
         if (!automationRunning) return;
 
         if (event != null
@@ -80,50 +82,47 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         super.onDestroy();
     }
 
-    public void beginAutomation(String text) {
-        String clean = text == null ? "" : text.trim();
+    public synchronized void resumeQueuedTask() {
+        SharedPreferences prefs =
+                getSharedPreferences(PREFS, MODE_PRIVATE);
 
-        if (clean.isEmpty()) return;
+        boolean autostart =
+                prefs.getBoolean(KEY_AUTOSTART, false);
 
+        long until =
+                prefs.getLong(KEY_UNTIL, 0L);
+
+        String text =
+                prefs.getString(KEY_TEXT, "");
+
+        if (!autostart
+                || System.currentTimeMillis() > until
+                || text == null
+                || text.trim().isEmpty()) {
+            return;
+        }
+
+        // 先同步清掉 autostart，防止 Activity 与 onServiceConnected
+        // 同时调用造成重复打开 DeepSeek。
+        boolean claimed = prefs.edit()
+                .putBoolean(KEY_AUTOSTART, false)
+                .commit();
+
+        if (!claimed) return;
+
+        beginAutomation(text.trim());
+    }
+
+    private void beginAutomation(String text) {
         handler.removeCallbacksAndMessages(null);
         hideDiagnosticOverlay();
 
-        activeText = clean;
+        activeText = text;
         automationRunning = true;
-        shareIntentSupported = false;
 
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_TEXT, clean)
-                .putLong(KEY_UNTIL, System.currentTimeMillis() + 30000L)
-                .putString(KEY_LAST_DIAG, "")
-                .apply();
-
-        putTextOnClipboard(clean);
-
-        if (!launchByShareIntent(clean)) {
-            launchDeepSeekNormally();
-        }
-
+        putTextOnClipboard(activeText);
+        launchDeepSeekNormally();
         schedulePolls();
-    }
-
-    private boolean launchByShareIntent(String text) {
-        try {
-            Intent send = new Intent(Intent.ACTION_SEND);
-            send.setType("text/plain");
-            send.putExtra(Intent.EXTRA_TEXT, text);
-            send.setPackage(TARGET_PACKAGE);
-            send.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-
-            if (send.resolveActivity(getPackageManager()) != null) {
-                shareIntentSupported = true;
-                startActivity(send);
-                return true;
-            }
-        } catch (Exception ignored) {}
-
-        return false;
     }
 
     private void launchDeepSeekNormally() {
@@ -164,16 +163,10 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         };
 
         for (int delay : delays) {
-            handler.postDelayed(
-                    this::pollAndAutomate,
-                    delay
-            );
+            handler.postDelayed(this::pollAndAutomate, delay);
         }
 
-        handler.postDelayed(
-                this::finalFailureCheck,
-                6800L
-        );
+        handler.postDelayed(this::finalFailureCheck, 6800L);
     }
 
     private final Runnable pollRunnable =
@@ -188,7 +181,6 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         if (root == null) return;
 
         CharSequence pkg = root.getPackageName();
-
         if (pkg == null
                 || !TARGET_PACKAGE.contentEquals(pkg)) {
             return;
@@ -211,15 +203,10 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 safe(input.getText()).trim();
 
         if (!activeText.equals(current)) {
-            if (!writeText(input, activeText)) {
-                return;
-            }
+            if (!writeText(input, activeText)) return;
         }
 
-        handler.postDelayed(
-                this::trySendNow,
-                220L
-        );
+        handler.postDelayed(this::trySendNow, 220L);
     }
 
     private void trySendNow() {
@@ -239,9 +226,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 safe(input.getText()).trim();
 
         if (!activeText.equals(current)) {
-            if (current.isEmpty()) {
-                finishSuccess();
-            }
+            if (current.isEmpty()) finishSuccess();
             return;
         }
 
@@ -252,12 +237,8 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
             send = findSafeGeometricSendCandidate(root, input);
         }
 
-        if (send != null
-                && clickNodeOrParent(send)) {
-            handler.postDelayed(
-                    this::verifyAfterSend,
-                    700L
-            );
+        if (send != null && clickNodeOrParent(send)) {
+            handler.postDelayed(this::verifyAfterSend, 700L);
         }
     }
 
@@ -291,8 +272,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         AccessibilityNodeInfo root =
                 getRootInActiveWindow();
 
-        String diag =
-                buildDiagnostic(root);
+        String diag = buildDiagnostic(root);
 
         getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
@@ -332,8 +312,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 getResources().getDisplayMetrics().heightPixels;
 
         while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node =
-                    queue.removeFirst();
+            AccessibilityNodeInfo node = queue.removeFirst();
 
             if (node.isVisibleToUser()) {
                 Rect r = new Rect();
@@ -408,8 +387,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 getResources().getDisplayMetrics().heightPixels;
 
         while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node =
-                    queue.removeFirst();
+            AccessibilityNodeInfo node = queue.removeFirst();
 
             if (node.isVisibleToUser()) {
                 Rect r = new Rect();
@@ -513,8 +491,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         int bestScore = Integer.MIN_VALUE;
 
         while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node =
-                    queue.removeFirst();
+            AccessibilityNodeInfo node = queue.removeFirst();
 
             if (node != input && node.isVisibleToUser()) {
                 String text = safe(node.getText()).trim();
@@ -542,9 +519,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                     score += 200;
                 }
 
-                if (containsExcludedControl(joined)) {
-                    score -= 500;
-                }
+                if (containsExcludedControl(joined)) score -= 500;
 
                 if ((node.isClickable()
                         || hasClickableParent(node))
@@ -566,7 +541,6 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
     ) {
         Rect inputBounds = new Rect();
         input.getBoundsInScreen(inputBounds);
-
         if (inputBounds.isEmpty()) return null;
 
         ArrayDeque<AccessibilityNodeInfo> queue =
@@ -582,8 +556,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 getResources().getDisplayMetrics().heightPixels;
 
         while (!queue.isEmpty()) {
-            AccessibilityNodeInfo node =
-                    queue.removeFirst();
+            AccessibilityNodeInfo node = queue.removeFirst();
 
             if (node != input
                     && node.isVisibleToUser()
@@ -617,16 +590,11 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                             score += 80;
                         }
 
-                        if (r.centerX()
-                                > inputBounds.centerX()) score += 55;
+                        if (r.centerX() > inputBounds.centerX()) score += 55;
+                        if (r.centerX() > screenWidth * 0.72f) score += 55;
 
-                        if (r.centerX()
-                                > screenWidth * 0.72f) score += 55;
-
-                        if (r.width()
-                                < screenWidth * 0.22f
-                                && r.height()
-                                < screenHeight * 0.14f) {
+                        if (r.width() < screenWidth * 0.22f
+                                && r.height() < screenHeight * 0.14f) {
                             score += 45;
                         }
 
@@ -655,8 +623,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 return true;
             }
 
-            AccessibilityNodeInfo parent =
-                    node.getParent();
+            AccessibilityNodeInfo parent = node.getParent();
 
             for (int depth = 0;
                  parent != null && depth < 4;
@@ -720,7 +687,6 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
     ) {
         for (AccessibilityNodeInfo.AccessibilityAction action
                 : node.getActionList()) {
-
             if (action.getId()
                     == AccessibilityNodeInfo.ACTION_SET_TEXT) {
                 return true;
@@ -733,8 +699,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
     private boolean hasClickableParent(
             AccessibilityNodeInfo node
     ) {
-        AccessibilityNodeInfo parent =
-                node.getParent();
+        AccessibilityNodeInfo parent = node.getParent();
 
         for (int depth = 0;
              parent != null && depth < 3;
@@ -778,12 +743,9 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         StringBuilder out = new StringBuilder();
 
         out.append(
-                "========== 问问 v1.3 DeepSeek 诊断 ==========\n"
+                "========== 问问 v1.4 DeepSeek 诊断 ==========\n"
         );
         out.append("text=").append(activeText).append("\n");
-        out.append("share_intent_supported=")
-                .append(shareIntentSupported)
-                .append("\n");
 
         if (root == null) {
             out.append("root=null\n");
@@ -803,11 +765,8 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
 
         int index = 0;
 
-        while (!queue.isEmpty()
-                && index < 220) {
-
-            AccessibilityNodeInfo node =
-                    queue.removeFirst();
+        while (!queue.isEmpty() && index < 220) {
+            AccessibilityNodeInfo node = queue.removeFirst();
 
             Rect r = new Rect();
             node.getBoundsInScreen(r);
@@ -961,7 +920,6 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 );
 
         params.gravity = Gravity.CENTER;
-
         diagnosticOverlay = panel;
 
         try {
@@ -1033,6 +991,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         ).edit()
                 .putString(KEY_TEXT, "")
                 .putLong(KEY_UNTIL, 0L)
+                .putBoolean(KEY_AUTOSTART, false)
                 .putString(KEY_LAST_DIAG, "")
                 .apply();
     }
