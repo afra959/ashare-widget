@@ -10,6 +10,8 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
@@ -25,13 +27,10 @@ import java.util.ArrayList;
 public class MainActivity extends Activity {
 
     private static final int REQ_AUDIO = 1001;
-    private static final String TARGET_PACKAGE = "com.deepseek.chat";
-    private static final String PREFS = "wenwen";
-    private static final String KEY_TEXT = "pending_text";
-    private static final String KEY_UNTIL = "pending_until";
 
     private SpeechRecognizer speechRecognizer;
     private boolean resultHandled = false;
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -43,7 +42,6 @@ public class MainActivity extends Activity {
         window.setStatusBarColor(Color.TRANSPARENT);
         window.setNavigationBarColor(Color.TRANSPARENT);
 
-        // 保持 Activity 本身透明；桌面仍然可见。
         FrameLayout invisibleRoot = new FrameLayout(this);
         invisibleRoot.setBackgroundColor(Color.TRANSPARENT);
         setContentView(invisibleRoot);
@@ -71,7 +69,7 @@ public class MainActivity extends Activity {
         )) {
             Toast.makeText(
                     this,
-                    "首次使用：请开启“问问自动输入”无障碍服务",
+                    "请开启“问问自动输入”无障碍服务",
                     Toast.LENGTH_LONG
             ).show();
 
@@ -95,7 +93,6 @@ public class MainActivity extends Activity {
         }
 
         resultHandled = false;
-
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
 
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
@@ -109,16 +106,13 @@ public class MainActivity extends Activity {
             }
 
             @Override
-            public void onBeginningOfSpeech() {
-            }
+            public void onBeginningOfSpeech() {}
 
             @Override
-            public void onRmsChanged(float rmsdB) {
-            }
+            public void onRmsChanged(float rmsdB) {}
 
             @Override
-            public void onBufferReceived(byte[] buffer) {
-            }
+            public void onBufferReceived(byte[] buffer) {}
 
             @Override
             public void onEndOfSpeech() {
@@ -200,42 +194,27 @@ public class MainActivity extends Activity {
                 }
 
                 resultHandled = true;
-                sendToDeepSeek(text);
+                handOffToAccessibilityService(text);
             }
 
             @Override
-            public void onPartialResults(Bundle partialResults) {
-            }
+            public void onPartialResults(Bundle partialResults) {}
 
             @Override
-            public void onEvent(int eventType, Bundle params) {
-            }
+            public void onEvent(int eventType, Bundle params) {}
         });
 
-        Intent intent = new Intent(
-                RecognizerIntent.ACTION_RECOGNIZE_SPEECH
-        );
+        Intent intent =
+                new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
 
         intent.putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
         );
-        intent.putExtra(
-                RecognizerIntent.EXTRA_LANGUAGE,
-                "zh-CN"
-        );
-        intent.putExtra(
-                RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
-                "zh-CN"
-        );
-        intent.putExtra(
-                RecognizerIntent.EXTRA_PARTIAL_RESULTS,
-                false
-        );
-        intent.putExtra(
-                RecognizerIntent.EXTRA_MAX_RESULTS,
-                3
-        );
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN");
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "zh-CN");
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
                 1050L
@@ -248,7 +227,8 @@ public class MainActivity extends Activity {
         speechRecognizer.startListening(intent);
     }
 
-    private void sendToDeepSeek(String text) {
+    private void handOffToAccessibilityService(String text) {
+        // 保留语音内容，失败时用户仍可直接粘贴。
         try {
             ClipboardManager cm =
                     (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
@@ -258,35 +238,45 @@ public class MainActivity extends Activity {
                         ClipData.newPlainText("问问识别结果", text)
                 );
             }
-        } catch (Exception ignored) {
+        } catch (Exception ignored) {}
+
+        DeepSeekAccessibilityService service =
+                DeepSeekAccessibilityService.instance;
+
+        if (service != null) {
+            service.beginAutomation(text);
+            finish();
+            return;
         }
 
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_TEXT, text)
-                .putLong(KEY_UNTIL, System.currentTimeMillis() + 25000L)
-                .apply();
+        // 已启用但系统刚好还没把 Service 实例连回来，短暂等待几次。
+        waitForServiceAndStart(text, 0);
+    }
 
-        Intent launchIntent =
-                getPackageManager().getLaunchIntentForPackage(TARGET_PACKAGE);
+    private void waitForServiceAndStart(String text, int attempt) {
+        DeepSeekAccessibilityService service =
+                DeepSeekAccessibilityService.instance;
 
-        if (launchIntent == null) {
+        if (service != null) {
+            service.beginAutomation(text);
+            finish();
+            return;
+        }
+
+        if (attempt >= 6) {
             Toast.makeText(
                     this,
-                    "未找到 DeepSeek，识别结果已复制",
+                    "“问问自动输入”服务尚未连接，请关闭再重新开启一次无障碍权限",
                     Toast.LENGTH_LONG
             ).show();
             finish();
             return;
         }
 
-        launchIntent.addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK
-                        | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+        handler.postDelayed(
+                () -> waitForServiceAndStart(text, attempt + 1),
+                250L
         );
-
-        startActivity(launchIntent);
-        finish();
     }
 
     private static boolean isAccessibilityServiceEnabled(
@@ -302,9 +292,7 @@ public class MainActivity extends Activity {
                         Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
                 );
 
-        if (TextUtils.isEmpty(enabledServices)) {
-            return false;
-        }
+        if (TextUtils.isEmpty(enabledServices)) return false;
 
         TextUtils.SimpleStringSplitter splitter =
                 new TextUtils.SimpleStringSplitter(':');
@@ -315,9 +303,7 @@ public class MainActivity extends Activity {
             ComponentName actual =
                     ComponentName.unflattenFromString(splitter.next());
 
-            if (expected.equals(actual)) {
-                return true;
-            }
+            if (expected.equals(actual)) return true;
         }
 
         return false;
@@ -352,12 +338,13 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
+
         if (speechRecognizer != null) {
             try {
                 speechRecognizer.cancel();
                 speechRecognizer.destroy();
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
         }
 
         super.onDestroy();
