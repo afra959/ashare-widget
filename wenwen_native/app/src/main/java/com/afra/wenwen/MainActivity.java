@@ -24,6 +24,7 @@ import android.widget.FrameLayout;
 import android.widget.Toast;
 
 import java.util.ArrayList;
+import java.util.Locale;
 
 public class MainActivity extends Activity {
 
@@ -35,6 +36,9 @@ public class MainActivity extends Activity {
 
     private SpeechRecognizer speechRecognizer;
     private boolean resultHandled = false;
+    private boolean overDetected = false;
+    private String partialBeforeOver = "";
+
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     @Override
@@ -98,6 +102,9 @@ public class MainActivity extends Activity {
         }
 
         resultHandled = false;
+        overDetected = false;
+        partialBeforeOver = "";
+
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
 
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
@@ -105,7 +112,7 @@ public class MainActivity extends Activity {
             public void onReadyForSpeech(Bundle params) {
                 Toast.makeText(
                         MainActivity.this,
-                        "正在聆听…",
+                        "正在聆听…说 over 结束",
                         Toast.LENGTH_SHORT
                 ).show();
             }
@@ -116,16 +123,26 @@ public class MainActivity extends Activity {
 
             @Override
             public void onEndOfSpeech() {
-                Toast.makeText(
-                        MainActivity.this,
-                        "正在识别…",
-                        Toast.LENGTH_SHORT
-                ).show();
+                if (!overDetected) {
+                    Toast.makeText(
+                            MainActivity.this,
+                            "正在识别…",
+                            Toast.LENGTH_SHORT
+                    ).show();
+                }
             }
 
             @Override
             public void onError(int error) {
                 if (resultHandled) return;
+
+                // 某些语音服务在手动 stopListening 后会回 ERROR_NO_MATCH。
+                // 如果已经通过 over 捕获到完整 partial，就直接使用它。
+                if (overDetected && !partialBeforeOver.isEmpty()) {
+                    resultHandled = true;
+                    queueAutomation(partialBeforeOver);
+                    return;
+                }
 
                 String message;
                 switch (error) {
@@ -162,21 +179,13 @@ public class MainActivity extends Activity {
                                 SpeechRecognizer.RESULTS_RECOGNITION
                         );
 
-                if (list == null || list.isEmpty()) {
-                    Toast.makeText(
-                            MainActivity.this,
-                            "没有识别到内容",
-                            Toast.LENGTH_LONG
-                    ).show();
-                    finish();
-                    return;
-                }
+                String text = firstNonEmpty(list);
 
-                String text = "";
-                for (String item : list) {
-                    if (item != null && !item.trim().isEmpty()) {
-                        text = item.trim();
-                        break;
+                if (overDetected) {
+                    text = stripTrailingOver(text);
+
+                    if (text.isEmpty()) {
+                        text = partialBeforeOver;
                     }
                 }
 
@@ -194,7 +203,35 @@ public class MainActivity extends Activity {
                 queueAutomation(text);
             }
 
-            @Override public void onPartialResults(Bundle partialResults) {}
+            @Override
+            public void onPartialResults(Bundle partialResults) {
+                if (resultHandled || overDetected) return;
+
+                ArrayList<String> list =
+                        partialResults.getStringArrayList(
+                                SpeechRecognizer.RESULTS_RECOGNITION
+                        );
+
+                String partial = firstNonEmpty(list);
+
+                if (partial.isEmpty()) return;
+
+                if (endsWithOver(partial)) {
+                    overDetected = true;
+                    partialBeforeOver = stripTrailingOver(partial);
+
+                    try {
+                        speechRecognizer.stopListening();
+                    } catch (Exception ignored) {}
+
+                    Toast.makeText(
+                            MainActivity.this,
+                            "已结束，正在识别…",
+                            Toast.LENGTH_SHORT
+                    ).show();
+                }
+            }
+
             @Override public void onEvent(int eventType, Bundle params) {}
         });
 
@@ -207,18 +244,59 @@ public class MainActivity extends Activity {
         );
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN");
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "zh-CN");
-        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
+
+        // 必须打开 partial 才能在用户说出 over 时即时终止。
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+
+        // over 是主结束方式；静默只作为忘记说 over 时的兜底。
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                1050L
+                2200L
         );
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                700L
+                1600L
         );
 
         speechRecognizer.startListening(intent);
+    }
+
+    private String firstNonEmpty(ArrayList<String> list) {
+        if (list == null) return "";
+
+        for (String item : list) {
+            if (item != null && !item.trim().isEmpty()) {
+                return item.trim();
+            }
+        }
+
+        return "";
+    }
+
+    private boolean endsWithOver(String raw) {
+        if (raw == null) return false;
+
+        String normalized = raw.trim()
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("[，。！？,.!?]+$", "")
+                .trim();
+
+        return normalized.equals("over")
+                || normalized.endsWith(" over");
+    }
+
+    private String stripTrailingOver(String raw) {
+        if (raw == null) return "";
+
+        String value = raw.trim();
+
+        // 先去掉结尾标点，再去掉独立的 over，再清理一次标点/空格。
+        value = value.replaceAll("[，。！？,.!?]+$", "").trim();
+        value = value.replaceFirst("(?i)(^|\\s)over$", "").trim();
+        value = value.replaceAll("[，。！？,.!?]+$", "").trim();
+
+        return value;
     }
 
     private void queueAutomation(String text) {
@@ -232,8 +310,6 @@ public class MainActivity extends Activity {
             }
         } catch (Exception ignored) {}
 
-        // 关键：同步落盘。即使 Activity 马上结束、Service 稍后才重连，
-        // 任务也不会丢失。
         SharedPreferences prefs =
                 getSharedPreferences(PREFS, MODE_PRIVATE);
 
