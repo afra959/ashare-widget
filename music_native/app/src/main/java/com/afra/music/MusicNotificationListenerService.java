@@ -78,6 +78,8 @@ public class MusicNotificationListenerService extends NotificationListenerServic
                                 .append(i)
                                 .append(" title=")
                                 .append(a.title)
+                                .append(" semantic=")
+                                .append(a.getSemanticAction())
                                 .append(" hasIntent=")
                                 .append(a.actionIntent != null)
                                 .append("\n");
