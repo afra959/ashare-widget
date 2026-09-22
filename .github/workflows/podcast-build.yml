@@ -4,7 +4,7 @@ on:
   push:
     branches: [ chatgpt-podcast-build-v1 ]
     paths:
-      - '.buildtrigger/podcast'
+      - '.buildtrigger/podcast-*'
 
 jobs:
   build:
