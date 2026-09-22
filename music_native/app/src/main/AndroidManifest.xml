@@ -8,7 +8,7 @@
     <application
         android:allowBackup="false"
         android:icon="@drawable/ic_music"
-        android:label="音乐"
+        android:label="音音"
         android:supportsRtl="true">
 
         <activity
@@ -24,7 +24,7 @@
 
         <service
             android:name=".MusicNotificationListenerService"
-            android:label="音乐媒体控制"
+            android:label="音音媒体控制"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
             android:exported="true">
             <intent-filter>
