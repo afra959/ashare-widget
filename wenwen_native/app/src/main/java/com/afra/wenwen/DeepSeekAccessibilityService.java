@@ -5,19 +5,30 @@ import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
+import android.graphics.Color;
 import android.graphics.Path;
 import android.graphics.Rect;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Gravity;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayDeque;
 import java.util.Locale;
 
 public class DeepSeekAccessibilityService extends AccessibilityService {
+
+    public static volatile DeepSeekAccessibilityService instance;
 
     private static final String TARGET_PACKAGE = "com.deepseek.chat";
     private static final String PREFS = "wenwen";
@@ -26,97 +37,193 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
     private static final String KEY_LAST_DIAG = "last_diag";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private boolean attemptsScheduled = false;
-    private boolean failureReported = false;
+
+    private String activeText = "";
+    private boolean automationRunning = false;
+    private boolean shareIntentSupported = false;
+
+    private WindowManager windowManager;
+    private android.view.View diagnosticOverlay;
+
+    @Override
+    protected void onServiceConnected() {
+        super.onServiceConnected();
+        instance = this;
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+    }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (event == null || event.getPackageName() == null) return;
-        if (!TARGET_PACKAGE.contentEquals(event.getPackageName())) return;
-        if (!isPending() || pendingText().isEmpty() || attemptsScheduled) return;
+        // v1.3 不再依赖事件触发自动化。
+        // 若任务正在进行，事件只用于加速下一次主动检查。
+        if (!automationRunning) return;
 
-        attemptsScheduled = true;
-        failureReported = false;
-
-        handler.postDelayed(this::tryAutomate, 250L);
-        handler.postDelayed(this::tryAutomate, 650L);
-        handler.postDelayed(this::tryAutomate, 1100L);
-        handler.postDelayed(this::tryAutomate, 1800L);
-        handler.postDelayed(this::tryAutomate, 2800L);
-        handler.postDelayed(this::tryAutomate, 4200L);
-        handler.postDelayed(this::reportFailureIfNeeded, 5400L);
+        if (event != null
+                && event.getPackageName() != null
+                && TARGET_PACKAGE.contentEquals(event.getPackageName())) {
+            handler.removeCallbacks(pollRunnable);
+            handler.postDelayed(pollRunnable, 120L);
+        }
     }
 
     @Override
     public void onInterrupt() {
         handler.removeCallbacksAndMessages(null);
-        attemptsScheduled = false;
+        automationRunning = false;
     }
 
-    private void tryAutomate() {
-        if (!isPending()) return;
-
-        String pending = pendingText();
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-
-        if (root == null) return;
-
-        AccessibilityNodeInfo input = findBestInput(root);
-
-        if (input == null) {
-            AccessibilityNodeInfo inputContainer =
-                    findLikelyInputContainer(root);
-
-            if (inputContainer != null
-                    && clickNodeOrParent(inputContainer)) {
-                handler.postDelayed(this::tryAutomate, 260L);
-            }
-            return;
-        }
-
-        if (!writeText(input, pending)) return;
-
-        handler.postDelayed(
-                () -> trySend(pending),
-                260L
-        );
+    @Override
+    public void onDestroy() {
+        if (instance == this) instance = null;
+        hideDiagnosticOverlay();
+        handler.removeCallbacksAndMessages(null);
+        super.onDestroy();
     }
 
-    private boolean writeText(
-            AccessibilityNodeInfo input,
-            String pending
-    ) {
-        String current = safe(input.getText()).trim();
+    public void beginAutomation(String text) {
+        String clean = text == null ? "" : text.trim();
 
-        if (pending.equals(current)) {
-            return true;
+        if (clean.isEmpty()) return;
+
+        handler.removeCallbacksAndMessages(null);
+        hideDiagnosticOverlay();
+
+        activeText = clean;
+        automationRunning = true;
+        shareIntentSupported = false;
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_TEXT, clean)
+                .putLong(KEY_UNTIL, System.currentTimeMillis() + 30000L)
+                .putString(KEY_LAST_DIAG, "")
+                .apply();
+
+        putTextOnClipboard(clean);
+
+        if (!launchByShareIntent(clean)) {
+            launchDeepSeekNormally();
         }
 
+        schedulePolls();
+    }
+
+    private boolean launchByShareIntent(String text) {
         try {
-            input.performAction(
-                    AccessibilityNodeInfo.ACTION_FOCUS
-            );
-        } catch (Exception ignored) {
-        }
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("text/plain");
+            send.putExtra(Intent.EXTRA_TEXT, text);
+            send.setPackage(TARGET_PACKAGE);
+            send.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
 
-        if (setNodeText(input, pending)) {
-            return true;
-        }
-
-        try {
-            if (input.isFocused()) {
-                return input.performAction(
-                        AccessibilityNodeInfo.ACTION_PASTE
-                );
+            if (send.resolveActivity(getPackageManager()) != null) {
+                shareIntentSupported = true;
+                startActivity(send);
+                return true;
             }
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
 
         return false;
     }
 
-    private void trySend(String pending) {
-        if (!isPending()) return;
+    private void launchDeepSeekNormally() {
+        try {
+            Intent launch =
+                    getPackageManager()
+                            .getLaunchIntentForPackage(TARGET_PACKAGE);
+
+            if (launch == null) {
+                showFailureOverlay(
+                        "未找到 DeepSeek",
+                        "package=" + TARGET_PACKAGE
+                );
+                automationRunning = false;
+                return;
+            }
+
+            launch.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            );
+
+            startActivity(launch);
+
+        } catch (Exception e) {
+            showFailureOverlay(
+                    "无法打开 DeepSeek",
+                    String.valueOf(e)
+            );
+            automationRunning = false;
+        }
+    }
+
+    private void schedulePolls() {
+        int[] delays = new int[]{
+                350, 700, 1100, 1600,
+                2300, 3200, 4300, 5600
+        };
+
+        for (int delay : delays) {
+            handler.postDelayed(
+                    this::pollAndAutomate,
+                    delay
+            );
+        }
+
+        handler.postDelayed(
+                this::finalFailureCheck,
+                6800L
+        );
+    }
+
+    private final Runnable pollRunnable =
+            this::pollAndAutomate;
+
+    private void pollAndAutomate() {
+        if (!automationRunning || !isPending()) return;
+
+        AccessibilityNodeInfo root =
+                getRootInActiveWindow();
+
+        if (root == null) return;
+
+        CharSequence pkg = root.getPackageName();
+
+        if (pkg == null
+                || !TARGET_PACKAGE.contentEquals(pkg)) {
+            return;
+        }
+
+        AccessibilityNodeInfo input =
+                findBestInput(root);
+
+        if (input == null) {
+            AccessibilityNodeInfo container =
+                    findLikelyInputContainer(root);
+
+            if (container != null) {
+                clickNodeOrParent(container);
+            }
+            return;
+        }
+
+        String current =
+                safe(input.getText()).trim();
+
+        if (!activeText.equals(current)) {
+            if (!writeText(input, activeText)) {
+                return;
+            }
+        }
+
+        handler.postDelayed(
+                this::trySendNow,
+                220L
+        );
+    }
+
+    private void trySendNow() {
+        if (!automationRunning || !isPending()) return;
 
         AccessibilityNodeInfo root =
                 getRootInActiveWindow();
@@ -131,38 +238,31 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         String current =
                 safe(input.getText()).trim();
 
-        if (!pending.equals(current)) {
-            if (current.isEmpty()) finishSuccess();
+        if (!activeText.equals(current)) {
+            if (current.isEmpty()) {
+                finishSuccess();
+            }
             return;
         }
 
-        AccessibilityNodeInfo semanticSend =
+        AccessibilityNodeInfo send =
                 findSemanticSendCandidate(root, input);
 
-        if (semanticSend != null
-                && clickNodeOrParent(semanticSend)) {
-            handler.postDelayed(
-                    () -> verifyAfterSend(pending),
-                    650L
-            );
-            return;
+        if (send == null) {
+            send = findSafeGeometricSendCandidate(root, input);
         }
 
-        // 只有在文字已经确认写入后，才允许使用几何兜底。
-        AccessibilityNodeInfo safeGeometricSend =
-                findSafeGeometricSendCandidate(root, input);
-
-        if (safeGeometricSend != null
-                && clickNodeOrParent(safeGeometricSend)) {
+        if (send != null
+                && clickNodeOrParent(send)) {
             handler.postDelayed(
-                    () -> verifyAfterSend(pending),
-                    650L
+                    this::verifyAfterSend,
+                    700L
             );
         }
     }
 
-    private void verifyAfterSend(String pending) {
-        if (!isPending()) return;
+    private void verifyAfterSend() {
+        if (!automationRunning || !isPending()) return;
 
         AccessibilityNodeInfo root =
                 getRootInActiveWindow();
@@ -180,9 +280,29 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         String current =
                 safe(input.getText()).trim();
 
-        if (!pending.equals(current)) {
+        if (!activeText.equals(current)) {
             finishSuccess();
         }
+    }
+
+    private void finalFailureCheck() {
+        if (!automationRunning || !isPending()) return;
+
+        AccessibilityNodeInfo root =
+                getRootInActiveWindow();
+
+        String diag =
+                buildDiagnostic(root);
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putString(KEY_LAST_DIAG, diag)
+                .apply();
+
+        showFailureOverlay(
+                "问问没有完成自动输入",
+                diag
+        );
     }
 
     private AccessibilityNodeInfo findBestInput(
@@ -232,15 +352,15 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
 
                 int score = 0;
 
-                if (node.isEditable()) score += 150;
-                if (cls.contains("edittext")) score += 100;
-                if (hasSetTextAction(node)) score += 80;
+                if (node.isEditable()) score += 170;
+                if (cls.contains("edittext")) score += 110;
+                if (hasSetTextAction(node)) score += 90;
                 if (node.isFocused()) score += 60;
 
                 if (!r.isEmpty()) {
                     if (r.centerY() > screenHeight * 0.48f) score += 45;
-                    if (r.width() > screenWidth * 0.32f) score += 25;
-                    if (r.height() < screenHeight * 0.24f) score += 10;
+                    if (r.width() > screenWidth * 0.30f) score += 25;
+                    if (r.height() < screenHeight * 0.25f) score += 10;
                 }
 
                 if (joined.contains("input")
@@ -254,7 +374,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                         || joined.contains("提问")
                         || joined.contains("问点什么")
                         || joined.contains("有任何问题")) {
-                    score += 40;
+                    score += 45;
                 }
 
                 if ((node.isEditable()
@@ -279,11 +399,8 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 new ArrayDeque<>();
         queue.add(root);
 
-        AccessibilityNodeInfo semantic = null;
-        int semanticScore = Integer.MIN_VALUE;
-
-        AccessibilityNodeInfo geometric = null;
-        int geometricScore = Integer.MIN_VALUE;
+        AccessibilityNodeInfo best = null;
+        int bestScore = Integer.MIN_VALUE;
 
         int screenWidth =
                 getResources().getDisplayMetrics().widthPixels;
@@ -305,15 +422,13 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                                 + safe(node.getContentDescription())
                 ).toLowerCase(Locale.ROOT);
 
-                boolean actionable =
-                        node.isClickable()
-                                || node.isFocusable()
-                                || hasClickableParent(node);
+                if (!r.isEmpty()
+                        && !containsExcludedControl(joined)
+                        && (node.isClickable()
+                        || node.isFocusable()
+                        || hasClickableParent(node))) {
 
-                if (actionable && !r.isEmpty()
-                        && !containsExcludedControl(joined)) {
-
-                    int s = 0;
+                    int score = 0;
 
                     if (joined.contains("input")
                             || joined.contains("message")
@@ -324,29 +439,16 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                             || joined.contains("提问")
                             || joined.contains("问点什么")
                             || joined.contains("有任何问题")) {
-                        s += 180;
+                        score += 180;
                     }
 
-                    if (r.centerY() > screenHeight * 0.52f) s += 35;
-                    if (r.width() > screenWidth * 0.38f) s += 35;
-                    if (r.height() < screenHeight * 0.20f) s += 15;
+                    if (r.centerY() > screenHeight * 0.58f) score += 55;
+                    if (r.width() > screenWidth * 0.38f) score += 55;
+                    if (r.height() < screenHeight * 0.22f) score += 20;
 
-                    if (s > semanticScore) {
-                        semantic = node;
-                        semanticScore = s;
-                    }
-
-                    int g = 0;
-
-                    if (r.centerY() > screenHeight * 0.62f) g += 60;
-                    if (r.width() > screenWidth * 0.45f) g += 70;
-                    if (r.height() < screenHeight * 0.22f) g += 20;
-                    if (r.left < screenWidth * 0.35f) g += 15;
-                    if (r.right > screenWidth * 0.65f) g += 15;
-
-                    if (g > geometricScore) {
-                        geometric = node;
-                        geometricScore = g;
+                    if (score > bestScore) {
+                        best = node;
+                        bestScore = score;
                     }
                 }
             }
@@ -354,10 +456,49 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
             addChildren(queue, node);
         }
 
-        if (semanticScore >= 180) return semantic;
-        if (geometricScore >= 150) return geometric;
+        return bestScore >= 120 ? best : null;
+    }
 
-        return null;
+    private boolean writeText(
+            AccessibilityNodeInfo input,
+            String text
+    ) {
+        try {
+            input.performAction(
+                    AccessibilityNodeInfo.ACTION_FOCUS
+            );
+        } catch (Exception ignored) {}
+
+        try {
+            Bundle args = new Bundle();
+
+            args.putCharSequence(
+                    AccessibilityNodeInfo
+                            .ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                    text
+            );
+
+            if (input.performAction(
+                    AccessibilityNodeInfo.ACTION_SET_TEXT,
+                    args
+            )) {
+                return true;
+            }
+        } catch (Exception ignored) {}
+
+        try {
+            if (input.isFocused()) {
+                putTextOnClipboard(text);
+
+                if (input.performAction(
+                        AccessibilityNodeInfo.ACTION_PASTE
+                )) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {}
+
+        return false;
     }
 
     private AccessibilityNodeInfo findSemanticSendCandidate(
@@ -476,13 +617,16 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                             score += 80;
                         }
 
-                        // 必须位于输入区右侧或屏幕最右侧。
-                        if (r.centerX() > inputBounds.centerX()) score += 55;
-                        if (r.centerX() > screenWidth * 0.72f) score += 55;
+                        if (r.centerX()
+                                > inputBounds.centerX()) score += 55;
 
-                        // 发送按钮应是小控件，不接受整块容器。
-                        if (r.width() < screenWidth * 0.22f
-                                && r.height() < screenHeight * 0.14f) {
+                        if (r.centerX()
+                                > screenWidth * 0.72f) score += 55;
+
+                        if (r.width()
+                                < screenWidth * 0.22f
+                                && r.height()
+                                < screenHeight * 0.14f) {
                             score += 45;
                         }
 
@@ -498,28 +642,6 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
         }
 
         return bestScore >= 190 ? best : null;
-    }
-
-    private boolean setNodeText(
-            AccessibilityNodeInfo node,
-            String text
-    ) {
-        try {
-            Bundle args = new Bundle();
-
-            args.putCharSequence(
-                    AccessibilityNodeInfo
-                            .ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                    text
-            );
-
-            return node.performAction(
-                    AccessibilityNodeInfo.ACTION_SET_TEXT,
-                    args
-            );
-        } catch (Exception ignored) {
-            return false;
-        }
     }
 
     private boolean clickNodeOrParent(
@@ -560,8 +682,7 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 );
             }
 
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
 
         return false;
     }
@@ -651,24 +772,225 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 || joined.contains("停止");
     }
 
-    private void reportFailureIfNeeded() {
-        attemptsScheduled = false;
+    private String buildDiagnostic(
+            AccessibilityNodeInfo root
+    ) {
+        StringBuilder out = new StringBuilder();
 
-        if (!isPending() || failureReported) return;
+        out.append(
+                "========== 问问 v1.3 DeepSeek 诊断 ==========\n"
+        );
+        out.append("text=").append(activeText).append("\n");
+        out.append("share_intent_supported=")
+                .append(shareIntentSupported)
+                .append("\n");
 
-        failureReported = true;
+        if (root == null) {
+            out.append("root=null\n");
+            return out.toString();
+        }
 
-        AccessibilityNodeInfo root =
-                getRootInActiveWindow();
+        out.append("root_package=")
+                .append(safe(root.getPackageName()))
+                .append("\n");
 
-        String diag =
-                buildDiagnostic(root);
+        int screenHeight =
+                getResources().getDisplayMetrics().heightPixels;
 
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
-                .putString(KEY_LAST_DIAG, diag)
-                .apply();
+        ArrayDeque<AccessibilityNodeInfo> queue =
+                new ArrayDeque<>();
+        queue.add(root);
 
+        int index = 0;
+
+        while (!queue.isEmpty()
+                && index < 220) {
+
+            AccessibilityNodeInfo node =
+                    queue.removeFirst();
+
+            Rect r = new Rect();
+            node.getBoundsInScreen(r);
+
+            if (!r.isEmpty()
+                    && r.bottom >= screenHeight * 0.35f) {
+
+                out.append("#")
+                        .append(index++)
+                        .append(" cls=")
+                        .append(safe(node.getClassName()))
+                        .append(" id=")
+                        .append(safe(node.getViewIdResourceName()))
+                        .append(" text=")
+                        .append(safe(node.getText()))
+                        .append(" hint=")
+                        .append(safe(node.getHintText()))
+                        .append(" desc=")
+                        .append(safe(node.getContentDescription()))
+                        .append(" editable=")
+                        .append(node.isEditable())
+                        .append(" focusable=")
+                        .append(node.isFocusable())
+                        .append(" focused=")
+                        .append(node.isFocused())
+                        .append(" clickable=")
+                        .append(node.isClickable())
+                        .append(" actions=")
+                        .append(node.getActions())
+                        .append(" bounds=")
+                        .append(r.toShortString())
+                        .append("\n");
+            }
+
+            addChildren(queue, node);
+        }
+
+        out.append("========== 诊断结束 ==========\n");
+        return out.toString();
+    }
+
+    private void showFailureOverlay(
+            String title,
+            String diag
+    ) {
+        hideDiagnosticOverlay();
+
+        if (windowManager == null) {
+            windowManager =
+                    (WindowManager) getSystemService(WINDOW_SERVICE);
+        }
+
+        if (windowManager == null) {
+            putTextOnClipboard(diag);
+            Toast.makeText(
+                    this,
+                    "诊断信息已复制",
+                    Toast.LENGTH_LONG
+            ).show();
+            return;
+        }
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(30, 24, 30, 24);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.rgb(32, 33, 36));
+        bg.setCornerRadius(28f);
+        panel.setBackground(bg);
+
+        TextView titleView = new TextView(this);
+        titleView.setText(title);
+        titleView.setTextColor(Color.rgb(246, 242, 234));
+        titleView.setTextSize(18f);
+        panel.addView(titleView);
+
+        TextView logView = new TextView(this);
+        logView.setText(diag);
+        logView.setTextColor(Color.rgb(246, 242, 234));
+        logView.setTextSize(11f);
+        logView.setTextIsSelectable(true);
+        logView.setPadding(0, 16, 0, 16);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(logView);
+
+        LinearLayout.LayoutParams scrollParams =
+                new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        0,
+                        1f
+                );
+        panel.addView(scroll, scrollParams);
+
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button copy = new Button(this);
+        copy.setText("复制诊断");
+        copy.setOnClickListener(v -> {
+            putTextOnClipboard(diag);
+            Toast.makeText(
+                    this,
+                    "诊断已复制",
+                    Toast.LENGTH_SHORT
+            ).show();
+        });
+
+        Button close = new Button(this);
+        close.setText("关闭");
+        close.setOnClickListener(v -> hideDiagnosticOverlay());
+
+        buttons.addView(
+                copy,
+                new LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f
+                )
+        );
+
+        buttons.addView(
+                close,
+                new LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f
+                )
+        );
+
+        panel.addView(buttons);
+
+        WindowManager.LayoutParams params =
+                new WindowManager.LayoutParams(
+                        (int) (
+                                getResources()
+                                        .getDisplayMetrics()
+                                        .widthPixels * 0.90f
+                        ),
+                        (int) (
+                                getResources()
+                                        .getDisplayMetrics()
+                                        .heightPixels * 0.62f
+                        ),
+                        WindowManager.LayoutParams
+                                .TYPE_ACCESSIBILITY_OVERLAY,
+                        WindowManager.LayoutParams
+                                .FLAG_LAYOUT_IN_SCREEN,
+                        android.graphics.PixelFormat.TRANSLUCENT
+                );
+
+        params.gravity = Gravity.CENTER;
+
+        diagnosticOverlay = panel;
+
+        try {
+            windowManager.addView(panel, params);
+        } catch (Exception e) {
+            diagnosticOverlay = null;
+            putTextOnClipboard(diag);
+            Toast.makeText(
+                    this,
+                    "诊断窗口显示失败，日志已复制",
+                    Toast.LENGTH_LONG
+            ).show();
+        }
+    }
+
+    private void hideDiagnosticOverlay() {
+        if (diagnosticOverlay != null
+                && windowManager != null) {
+            try {
+                windowManager.removeView(
+                        diagnosticOverlay
+                );
+            } catch (Exception ignored) {}
+        }
+
+        diagnosticOverlay = null;
+    }
+
+    private void putTextOnClipboard(String text) {
         try {
             ClipboardManager cm =
                     (ClipboardManager)
@@ -679,129 +1001,12 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
             if (cm != null) {
                 cm.setPrimaryClip(
                         ClipData.newPlainText(
-                                "问问诊断",
-                                diag
+                                "问问",
+                                text
                         )
                 );
             }
-        } catch (Exception ignored) {
-        }
-
-        Toast.makeText(
-                this,
-                "自动输入/发送未完成；诊断信息已复制",
-                Toast.LENGTH_LONG
-        ).show();
-    }
-
-    private String buildDiagnostic(
-            AccessibilityNodeInfo root
-    ) {
-        StringBuilder out =
-                new StringBuilder();
-
-        out.append(
-                "========== 问问 v1.2 DeepSeek 诊断 ==========\n"
-        );
-
-        out.append("pending=")
-                .append(pendingText())
-                .append("\n");
-
-        if (root == null) {
-            out.append("root=null\n");
-            return out.toString();
-        }
-
-        int screenHeight =
-                getResources()
-                        .getDisplayMetrics()
-                        .heightPixels;
-
-        ArrayDeque<AccessibilityNodeInfo> queue =
-                new ArrayDeque<>();
-
-        queue.add(root);
-
-        int index = 0;
-
-        while (!queue.isEmpty()
-                && index < 180) {
-
-            AccessibilityNodeInfo node =
-                    queue.removeFirst();
-
-            Rect r = new Rect();
-            node.getBoundsInScreen(r);
-
-            if (!r.isEmpty()
-                    && r.bottom
-                    >= screenHeight * 0.40f) {
-
-                out.append("#")
-                        .append(index++)
-                        .append(" cls=")
-                        .append(
-                                safe(node.getClassName())
-                        )
-                        .append(" id=")
-                        .append(
-                                safe(
-                                        node.getViewIdResourceName()
-                                )
-                        )
-                        .append(" text=")
-                        .append(
-                                safe(node.getText())
-                        )
-                        .append(" hint=")
-                        .append(
-                                safe(node.getHintText())
-                        )
-                        .append(" desc=")
-                        .append(
-                                safe(
-                                        node.getContentDescription()
-                                )
-                        )
-                        .append(" editable=")
-                        .append(node.isEditable())
-                        .append(" focusable=")
-                        .append(node.isFocusable())
-                        .append(" focused=")
-                        .append(node.isFocused())
-                        .append(" clickable=")
-                        .append(node.isClickable())
-                        .append(" bounds=")
-                        .append(r.toShortString())
-                        .append("\n");
-            }
-
-            addChildren(queue, node);
-        }
-
-        out.append(
-                "========== 诊断结束 ==========\n"
-        );
-
-        return out.toString();
-    }
-
-    private void addChildren(
-            ArrayDeque<AccessibilityNodeInfo> queue,
-            AccessibilityNodeInfo node
-    ) {
-        for (int i = 0;
-             i < node.getChildCount();
-             i++) {
-
-            AccessibilityNodeInfo child =
-                    node.getChild(i);
-
-            if (child != null) {
-                queue.addLast(child);
-            }
-        }
+        } catch (Exception ignored) {}
     }
 
     private boolean isPending() {
@@ -814,28 +1019,14 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                         0L
                 );
 
-        return System.currentTimeMillis()
-                <= until;
-    }
-
-    private String pendingText() {
-        if (!isPending()) return "";
-
-        String text =
-                getSharedPreferences(
-                        PREFS,
-                        MODE_PRIVATE
-                ).getString(
-                        KEY_TEXT,
-                        ""
-                );
-
-        return text == null
-                ? ""
-                : text.trim();
+        return System.currentTimeMillis() <= until;
     }
 
     private void finishSuccess() {
+        automationRunning = false;
+        handler.removeCallbacksAndMessages(null);
+        hideDiagnosticOverlay();
+
         getSharedPreferences(
                 PREFS,
                 MODE_PRIVATE
@@ -844,17 +1035,22 @@ public class DeepSeekAccessibilityService extends AccessibilityService {
                 .putLong(KEY_UNTIL, 0L)
                 .putString(KEY_LAST_DIAG, "")
                 .apply();
-
-        failureReported = false;
-        attemptsScheduled = false;
-        handler.removeCallbacksAndMessages(null);
     }
 
-    private String safe(
-            CharSequence value
+    private void addChildren(
+            ArrayDeque<AccessibilityNodeInfo> queue,
+            AccessibilityNodeInfo node
     ) {
-        return value == null
-                ? ""
-                : value.toString();
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+
+            if (child != null) {
+                queue.addLast(child);
+            }
+        }
+    }
+
+    private String safe(CharSequence value) {
+        return value == null ? "" : value.toString();
     }
 }
