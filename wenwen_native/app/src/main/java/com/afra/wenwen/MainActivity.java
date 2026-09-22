@@ -36,9 +36,6 @@ public class MainActivity extends Activity {
 
     private SpeechRecognizer speechRecognizer;
     private boolean resultHandled = false;
-    private boolean overDetected = false;
-    private String partialBeforeOver = "";
-
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     @Override
@@ -102,9 +99,6 @@ public class MainActivity extends Activity {
         }
 
         resultHandled = false;
-        overDetected = false;
-        partialBeforeOver = "";
-
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
 
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
@@ -123,7 +117,7 @@ public class MainActivity extends Activity {
 
             @Override
             public void onEndOfSpeech() {
-                if (!overDetected) {
+                if (!resultHandled) {
                     Toast.makeText(
                             MainActivity.this,
                             "正在识别…",
@@ -135,14 +129,6 @@ public class MainActivity extends Activity {
             @Override
             public void onError(int error) {
                 if (resultHandled) return;
-
-                // 某些语音服务在手动 stopListening 后会回 ERROR_NO_MATCH。
-                // 如果已经通过 over 捕获到完整 partial，就直接使用它。
-                if (overDetected && !partialBeforeOver.isEmpty()) {
-                    resultHandled = true;
-                    queueAutomation(partialBeforeOver);
-                    return;
-                }
 
                 String message;
                 switch (error) {
@@ -174,19 +160,14 @@ public class MainActivity extends Activity {
             public void onResults(Bundle results) {
                 if (resultHandled) return;
 
-                ArrayList<String> list =
+                String text = firstNonEmpty(
                         results.getStringArrayList(
                                 SpeechRecognizer.RESULTS_RECOGNITION
-                        );
+                        )
+                );
 
-                String text = firstNonEmpty(list);
-
-                if (overDetected) {
+                if (endsWithOver(text)) {
                     text = stripTrailingOver(text);
-
-                    if (text.isEmpty()) {
-                        text = partialBeforeOver;
-                    }
                 }
 
                 if (text.isEmpty()) {
@@ -205,31 +186,33 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPartialResults(Bundle partialResults) {
-                if (resultHandled || overDetected) return;
+                if (resultHandled) return;
 
-                ArrayList<String> list =
+                String partial = firstNonEmpty(
                         partialResults.getStringArrayList(
                                 SpeechRecognizer.RESULTS_RECOGNITION
-                        );
+                        )
+                );
 
-                String partial = firstNonEmpty(list);
-
-                if (partial.isEmpty()) return;
-
-                if (endsWithOver(partial)) {
-                    overDetected = true;
-                    partialBeforeOver = stripTrailingOver(partial);
-
-                    try {
-                        speechRecognizer.stopListening();
-                    } catch (Exception ignored) {}
-
-                    Toast.makeText(
-                            MainActivity.this,
-                            "已结束，正在识别…",
-                            Toast.LENGTH_SHORT
-                    ).show();
+                if (partial.isEmpty() || !endsWithOver(partial)) {
+                    return;
                 }
+
+                String cleaned = stripTrailingOver(partial);
+
+                if (cleaned.isEmpty()) {
+                    return;
+                }
+
+                // 快速路径：检测到 over 后直接使用当前 partial，
+                // 不再等待 Recognizer 的最终结果。
+                resultHandled = true;
+
+                try {
+                    speechRecognizer.cancel();
+                } catch (Exception ignored) {}
+
+                queueAutomation(cleaned);
             }
 
             @Override public void onEvent(int eventType, Bundle params) {}
@@ -244,19 +227,17 @@ public class MainActivity extends Activity {
         );
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN");
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "zh-CN");
-
-        // 必须打开 partial 才能在用户说出 over 时即时终止。
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
 
-        // over 是主结束方式；静默只作为忘记说 over 时的兜底。
+        // 忘记说 over 时仍能自动结束，但 over 才是快速结束方式。
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                2200L
+                1200L
         );
         intent.putExtra(
                 RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                1600L
+                800L
         );
 
         speechRecognizer.startListening(intent);
@@ -277,25 +258,37 @@ public class MainActivity extends Activity {
     private boolean endsWithOver(String raw) {
         if (raw == null) return false;
 
-        String normalized = raw.trim()
+        String value = raw.trim()
                 .toLowerCase(Locale.ROOT)
                 .replaceAll("[，。！？,.!?]+$", "")
                 .trim();
 
-        return normalized.equals("over")
-                || normalized.endsWith(" over");
+        if (!value.endsWith("over")) return false;
+
+        int start = value.length() - 4;
+
+        if (start == 0) return true;
+
+        char previous = value.charAt(start - 1);
+
+        // 中文后直接接 over 也算结束词；英文单词 turnover 之类不误判。
+        return !(
+                (previous >= 'a' && previous <= 'z')
+                        || (previous >= 'A' && previous <= 'Z')
+        );
     }
 
     private String stripTrailingOver(String raw) {
         if (raw == null) return "";
 
         String value = raw.trim();
-
-        // 先去掉结尾标点，再去掉独立的 over，再清理一次标点/空格。
-        value = value.replaceAll("[，。！？,.!?]+$", "").trim();
-        value = value.replaceFirst("(?i)(^|\\s)over$", "").trim();
         value = value.replaceAll("[，。！？,.!?]+$", "").trim();
 
+        if (endsWithOver(value)) {
+            value = value.substring(0, value.length() - 4).trim();
+        }
+
+        value = value.replaceAll("[，。！？,.!?]+$", "").trim();
         return value;
     }
 
@@ -303,6 +296,7 @@ public class MainActivity extends Activity {
         try {
             ClipboardManager cm =
                     (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+
             if (cm != null) {
                 cm.setPrimaryClip(
                         ClipData.newPlainText("问问识别结果", text)
@@ -315,7 +309,7 @@ public class MainActivity extends Activity {
 
         boolean saved = prefs.edit()
                 .putString(KEY_TEXT, text)
-                .putLong(KEY_UNTIL, System.currentTimeMillis() + 30000L)
+                .putLong(KEY_UNTIL, System.currentTimeMillis() + 15000L)
                 .putBoolean(KEY_AUTOSTART, true)
                 .commit();
 
@@ -342,10 +336,10 @@ public class MainActivity extends Activity {
             return;
         }
 
-        if (attempt >= 20) {
+        if (attempt >= 12) {
             Toast.makeText(
                     this,
-                    "无障碍服务没有连接。请把“问问自动输入”关闭后重新开启一次。",
+                    "无障碍服务没有连接，请重新开启“问问自动输入”",
                     Toast.LENGTH_LONG
             ).show();
             finish();
@@ -354,7 +348,7 @@ public class MainActivity extends Activity {
 
         handler.postDelayed(
                 () -> tryStartQueuedTask(attempt + 1),
-                250L
+                200L
         );
     }
 
