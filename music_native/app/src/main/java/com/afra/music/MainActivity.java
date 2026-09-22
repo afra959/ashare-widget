@@ -1,17 +1,21 @@
 package com.afra.music;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
 import android.media.AudioManager;
+import android.media.MediaMetadata;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
+import android.media.session.PlaybackState;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
-import android.view.KeyEvent;
 import android.widget.Toast;
 
 import java.util.List;
@@ -19,7 +23,9 @@ import java.util.List;
 public class MainActivity extends Activity {
 
     private static final String TARGET_PACKAGE = "com.netease.cloudmusic";
+
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final StringBuilder log = new StringBuilder();
     private ComponentName listenerComponent;
 
     @Override
@@ -31,10 +37,16 @@ public class MainActivity extends Activity {
                 MusicNotificationListenerService.class
         );
 
+        log.append("========== 音乐 v1.6 诊断 ==========\n");
+        log.append("notification_access=").append(isNotificationAccessEnabled()).append("\n");
+        log.append("listener_instance=")
+                .append(MusicNotificationListenerService.instance != null)
+                .append("\n");
+
         if (!isNotificationAccessEnabled()) {
             Toast.makeText(
                     this,
-                    "首次使用：请开启“音乐媒体控制”的通知使用权",
+                    "请先开启“音乐媒体控制”的通知使用权",
                     Toast.LENGTH_LONG
             ).show();
 
@@ -50,9 +62,10 @@ public class MainActivity extends Activity {
 
         Intent launchIntent = getPackageManager().getLaunchIntentForPackage(TARGET_PACKAGE);
 
+        log.append("launchIntent=").append(launchIntent != null).append("\n");
+
         if (launchIntent == null) {
-            Toast.makeText(this, "未找到网易云音乐", Toast.LENGTH_SHORT).show();
-            finish();
+            copyAndFinish();
             return;
         }
 
@@ -63,81 +76,103 @@ public class MainActivity extends Activity {
 
         startActivity(launchIntent);
 
-        // 网易云可能需要一点时间重新建立 MediaSession。
-        handler.postDelayed(this::playTargetSession, 600L);
-        handler.postDelayed(this::playTargetSession, 1200L);
-        handler.postDelayed(this::playTargetSession, 2200L);
-        handler.postDelayed(this::playTargetSession, 3500L);
-        handler.postDelayed(this::playTargetSession, 5000L);
+        handler.postDelayed(() -> inspectRound("R1-800ms"), 800L);
+        handler.postDelayed(() -> inspectRound("R2-1800ms"), 1800L);
+        handler.postDelayed(() -> inspectRound("R3-3200ms"), 3200L);
+        handler.postDelayed(() -> inspectRound("R4-5000ms"), 5000L);
 
-        handler.postDelayed(this::finish, 5600L);
+        handler.postDelayed(this::copyAndFinish, 5800L);
     }
 
-    private void playTargetSession() {
-        boolean controlled = false;
+    private void inspectRound(String label) {
+        log.append("\n--- ").append(label).append(" ---\n");
 
+        AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+
+        if (am != null) {
+            log.append("isMusicActive=").append(am.isMusicActive()).append("\n");
+        }
+
+        inspectSessions();
+
+        MusicNotificationListenerService service =
+                MusicNotificationListenerService.instance;
+
+        log.append("listener_instance_now=").append(service != null).append("\n");
+
+        if (service != null) {
+            String notifResult = service.inspectAndTryNotification(TARGET_PACKAGE);
+            log.append(notifResult);
+        }
+    }
+
+    private void inspectSessions() {
         try {
             MediaSessionManager manager =
                     (MediaSessionManager) getSystemService(MEDIA_SESSION_SERVICE);
 
-            if (manager != null) {
-                List<MediaController> controllers =
-                        manager.getActiveSessions(listenerComponent);
+            if (manager == null) {
+                log.append("session_manager=null\n");
+                return;
+            }
 
-                for (MediaController controller : controllers) {
-                    if (controller == null) {
-                        continue;
-                    }
+            List<MediaController> controllers =
+                    manager.getActiveSessions(listenerComponent);
 
-                    if (TARGET_PACKAGE.equals(controller.getPackageName())) {
+            log.append("session_count=").append(controllers.size()).append("\n");
+
+            for (int i = 0; i < controllers.size(); i++) {
+                MediaController c = controllers.get(i);
+
+                if (c == null) {
+                    continue;
+                }
+
+                String pkg = c.getPackageName();
+                PlaybackState state = c.getPlaybackState();
+                MediaMetadata meta = c.getMetadata();
+
+                log.append("SESSION#").append(i)
+                        .append(" pkg=").append(pkg);
+
+                if (state != null) {
+                    log.append(" state=").append(state.getState())
+                            .append(" actions=").append(state.getActions());
+                } else {
+                    log.append(" state=null");
+                }
+
+                if (meta != null) {
+                    CharSequence title =
+                            meta.getText(MediaMetadata.METADATA_KEY_TITLE);
+                    CharSequence artist =
+                            meta.getText(MediaMetadata.METADATA_KEY_ARTIST);
+
+                    log.append(" title=").append(title)
+                            .append(" artist=").append(artist);
+                }
+
+                log.append("\n");
+
+                if (TARGET_PACKAGE.equals(pkg)) {
+                    try {
                         MediaController.TransportControls controls =
-                                controller.getTransportControls();
+                                c.getTransportControls();
 
                         if (controls != null) {
                             controls.play();
-                            controlled = true;
+                            log.append("  -> controls.play() CALLED\n");
                         }
+                    } catch (Exception e) {
+                        log.append("  -> controls.play() ERROR ").append(e).append("\n");
                     }
                 }
             }
-        } catch (SecurityException ignored) {
-        } catch (Exception ignored) {
-        }
 
-        if (!controlled) {
-            // 最后的兼容兜底：若网易云刚启动但 session 尚未进入列表，
-            // 补发显式 PLAY 媒体键；不会把已播放状态切成暂停。
-            sendPlayKey();
-        }
-    }
-
-    private void sendPlayKey() {
-        AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
-
-        if (audioManager == null) {
-            return;
-        }
-
-        long now = android.os.SystemClock.uptimeMillis();
-
-        KeyEvent down = new KeyEvent(
-                now, now,
-                KeyEvent.ACTION_DOWN,
-                KeyEvent.KEYCODE_MEDIA_PLAY,
-                0
-        );
-
-        KeyEvent up = new KeyEvent(
-                now, now,
-                KeyEvent.ACTION_UP,
-                KeyEvent.KEYCODE_MEDIA_PLAY,
-                0
-        );
-
-        try {
-            audioManager.dispatchMediaKeyEvent(down);
-            audioManager.dispatchMediaKeyEvent(up);
-        } catch (Exception ignored) {
+        } catch (SecurityException e) {
+            log.append("session_security_error=").append(e).append("\n");
+        } catch (Exception e) {
+            log.append("session_error=").append(e).append("\n");
         }
     }
 
@@ -166,6 +201,30 @@ public class MainActivity extends Activity {
         }
 
         return false;
+    }
+
+    private void copyAndFinish() {
+        log.append("\n========== 诊断结束 ==========\n");
+
+        try {
+            ClipboardManager cm =
+                    (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+
+            if (cm != null) {
+                cm.setPrimaryClip(
+                        ClipData.newPlainText("音乐诊断日志", log.toString())
+                );
+            }
+        } catch (Exception ignored) {
+        }
+
+        Toast.makeText(
+                this,
+                "诊断完成，日志已复制到剪贴板",
+                Toast.LENGTH_LONG
+        ).show();
+
+        finish();
     }
 
     @Override
