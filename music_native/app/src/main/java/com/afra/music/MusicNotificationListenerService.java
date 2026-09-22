@@ -1,11 +1,8 @@
 package com.afra.music;
 
 import android.app.Notification;
-import android.app.PendingIntent;
 import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
-
-import java.util.Locale;
 
 public class MusicNotificationListenerService extends NotificationListenerService {
 
@@ -23,13 +20,15 @@ public class MusicNotificationListenerService extends NotificationListenerServic
         super.onListenerDisconnected();
     }
 
-    public synchronized String inspectAndTryNotification(String targetPackage) {
+    public synchronized String inspectNotifications(String targetPackage) {
         StringBuilder out = new StringBuilder();
 
         try {
             StatusBarNotification[] items = getActiveNotifications();
 
-            out.append("notification_count=").append(items == null ? 0 : items.length).append("\n");
+            out.append("notification_count=")
+                    .append(items == null ? 0 : items.length)
+                    .append("\n");
 
             if (items == null) {
                 return out.toString();
@@ -46,10 +45,13 @@ public class MusicNotificationListenerService extends NotificationListenerServic
                 out.append("NOTIF pkg=").append(pkg);
 
                 if (n != null && n.extras != null) {
-                    CharSequence title = n.extras.getCharSequence(Notification.EXTRA_TITLE);
-                    CharSequence text = n.extras.getCharSequence(Notification.EXTRA_TEXT);
-                    out.append(" title=").append(title);
-                    out.append(" text=").append(text);
+                    CharSequence title =
+                            n.extras.getCharSequence(Notification.EXTRA_TITLE);
+                    CharSequence body =
+                            n.extras.getCharSequence(Notification.EXTRA_TEXT);
+
+                    out.append(" title=").append(title)
+                            .append(" text=").append(body);
                 }
 
                 out.append("\n");
@@ -59,47 +61,26 @@ public class MusicNotificationListenerService extends NotificationListenerServic
                 }
 
                 Notification.Action[] actions = n.actions;
-                out.append("  actions=").append(actions == null ? 0 : actions.length).append("\n");
 
-                if (actions == null) {
-                    continue;
-                }
+                out.append("  target_actions=")
+                        .append(actions == null ? 0 : actions.length)
+                        .append("\n");
 
-                for (int i = 0; i < actions.length; i++) {
-                    Notification.Action action = actions[i];
-                    if (action == null) {
-                        continue;
-                    }
+                if (actions != null) {
+                    for (int i = 0; i < actions.length; i++) {
+                        Notification.Action a = actions[i];
 
-                    String title = String.valueOf(action.title);
-                    String low = title.toLowerCase(Locale.ROOT);
-
-                    out.append("  ACTION#").append(i)
-                            .append(" title=").append(title)
-                            .append(" hasIntent=").append(action.actionIntent != null)
-                            .append("\n");
-
-                    boolean looksPlay =
-                            low.contains("play")
-                                    || low.contains("resume")
-                                    || title.contains("播放")
-                                    || title.contains("继续");
-
-                    boolean looksPause =
-                            low.contains("pause")
-                                    || title.contains("暂停");
-
-                    if (looksPause) {
-                        out.append("  -> notification indicates already playing\n");
-                    }
-
-                    if (looksPlay && action.actionIntent != null) {
-                        try {
-                            action.actionIntent.send();
-                            out.append("  -> SENT notification play action\n");
-                        } catch (PendingIntent.CanceledException e) {
-                            out.append("  -> send failed: ").append(e).append("\n");
+                        if (a == null) {
+                            continue;
                         }
+
+                        out.append("  ACTION#")
+                                .append(i)
+                                .append(" title=")
+                                .append(a.title)
+                                .append(" hasIntent=")
+                                .append(a.actionIntent != null)
+                                .append("\n");
                     }
                 }
             }
