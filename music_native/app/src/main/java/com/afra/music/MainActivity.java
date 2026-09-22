@@ -38,7 +38,7 @@ public class MainActivity extends Activity {
         if (!isNotificationAccessEnabled()) {
             Toast.makeText(
                     this,
-                    "请开启“音乐媒体控制”的通知使用权",
+                    "请开启“音音媒体控制”的通知使用权",
                     Toast.LENGTH_LONG
             ).show();
 
