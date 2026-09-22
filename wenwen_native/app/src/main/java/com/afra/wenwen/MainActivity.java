@@ -7,6 +7,7 @@ import android.content.ClipboardManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.os.Bundle;
@@ -27,6 +28,10 @@ import java.util.ArrayList;
 public class MainActivity extends Activity {
 
     private static final int REQ_AUDIO = 1001;
+    private static final String PREFS = "wenwen";
+    private static final String KEY_TEXT = "pending_text";
+    private static final String KEY_UNTIL = "pending_until";
+    private static final String KEY_AUTOSTART = "pending_autostart";
 
     private SpeechRecognizer speechRecognizer;
     private boolean resultHandled = false;
@@ -105,14 +110,9 @@ public class MainActivity extends Activity {
                 ).show();
             }
 
-            @Override
-            public void onBeginningOfSpeech() {}
-
-            @Override
-            public void onRmsChanged(float rmsdB) {}
-
-            @Override
-            public void onBufferReceived(byte[] buffer) {}
+            @Override public void onBeginningOfSpeech() {}
+            @Override public void onRmsChanged(float rmsdB) {}
+            @Override public void onBufferReceived(byte[] buffer) {}
 
             @Override
             public void onEndOfSpeech() {
@@ -128,7 +128,6 @@ public class MainActivity extends Activity {
                 if (resultHandled) return;
 
                 String message;
-
                 switch (error) {
                     case SpeechRecognizer.ERROR_NO_MATCH:
                     case SpeechRecognizer.ERROR_SPEECH_TIMEOUT:
@@ -151,7 +150,6 @@ public class MainActivity extends Activity {
                         message,
                         Toast.LENGTH_LONG
                 ).show();
-
                 finish();
             }
 
@@ -175,7 +173,6 @@ public class MainActivity extends Activity {
                 }
 
                 String text = "";
-
                 for (String item : list) {
                     if (item != null && !item.trim().isEmpty()) {
                         text = item.trim();
@@ -194,14 +191,11 @@ public class MainActivity extends Activity {
                 }
 
                 resultHandled = true;
-                handOffToAccessibilityService(text);
+                queueAutomation(text);
             }
 
-            @Override
-            public void onPartialResults(Bundle partialResults) {}
-
-            @Override
-            public void onEvent(int eventType, Bundle params) {}
+            @Override public void onPartialResults(Bundle partialResults) {}
+            @Override public void onEvent(int eventType, Bundle params) {}
         });
 
         Intent intent =
@@ -227,12 +221,10 @@ public class MainActivity extends Activity {
         speechRecognizer.startListening(intent);
     }
 
-    private void handOffToAccessibilityService(String text) {
-        // 保留语音内容，失败时用户仍可直接粘贴。
+    private void queueAutomation(String text) {
         try {
             ClipboardManager cm =
                     (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-
             if (cm != null) {
                 cm.setPrimaryClip(
                         ClipData.newPlainText("问问识别结果", text)
@@ -240,33 +232,44 @@ public class MainActivity extends Activity {
             }
         } catch (Exception ignored) {}
 
-        DeepSeekAccessibilityService service =
-                DeepSeekAccessibilityService.instance;
+        // 关键：同步落盘。即使 Activity 马上结束、Service 稍后才重连，
+        // 任务也不会丢失。
+        SharedPreferences prefs =
+                getSharedPreferences(PREFS, MODE_PRIVATE);
 
-        if (service != null) {
-            service.beginAutomation(text);
-            finish();
-            return;
-        }
+        boolean saved = prefs.edit()
+                .putString(KEY_TEXT, text)
+                .putLong(KEY_UNTIL, System.currentTimeMillis() + 30000L)
+                .putBoolean(KEY_AUTOSTART, true)
+                .commit();
 
-        // 已启用但系统刚好还没把 Service 实例连回来，短暂等待几次。
-        waitForServiceAndStart(text, 0);
-    }
-
-    private void waitForServiceAndStart(String text, int attempt) {
-        DeepSeekAccessibilityService service =
-                DeepSeekAccessibilityService.instance;
-
-        if (service != null) {
-            service.beginAutomation(text);
-            finish();
-            return;
-        }
-
-        if (attempt >= 6) {
+        if (!saved) {
             Toast.makeText(
                     this,
-                    "“问问自动输入”服务尚未连接，请关闭再重新开启一次无障碍权限",
+                    "无法保存语音任务",
+                    Toast.LENGTH_LONG
+            ).show();
+            finish();
+            return;
+        }
+
+        tryStartQueuedTask(0);
+    }
+
+    private void tryStartQueuedTask(int attempt) {
+        DeepSeekAccessibilityService service =
+                DeepSeekAccessibilityService.instance;
+
+        if (service != null) {
+            service.resumeQueuedTask();
+            finish();
+            return;
+        }
+
+        if (attempt >= 20) {
+            Toast.makeText(
+                    this,
+                    "无障碍服务没有连接。请把“问问自动输入”关闭后重新开启一次。",
                     Toast.LENGTH_LONG
             ).show();
             finish();
@@ -274,7 +277,7 @@ public class MainActivity extends Activity {
         }
 
         handler.postDelayed(
-                () -> waitForServiceAndStart(text, attempt + 1),
+                () -> tryStartQueuedTask(attempt + 1),
                 250L
         );
     }
